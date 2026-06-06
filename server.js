@@ -200,66 +200,122 @@ io.on("connection", (socket) => {
     });
 
     // JOIN CHAT 1-1
-    socket.on("join_friend_chat", ({ currentUserId, friendId }) => {
-      if (!currentUserId || !friendId) return;
+    socket.on("join_friend_chat", async ({ currentUserId, friendId }) => {
+  if (!currentUserId || !friendId) return;
 
-      const chatId = getFriendChatId(currentUserId, friendId);
-      socket.join(chatId);
+  const chatId = getFriendChatId(currentUserId, friendId);
+  socket.join(chatId);
 
-      if (!friendChats.has(chatId)) {
-        friendChats.set(chatId, []);
-      }
+  try {
+    const snap = await db
+      .collection("friend_messages")
+      .where("chatId", "==", chatId)
+      .orderBy("createdAt", "desc")
+      .limit(50)
+      .get();
 
-      socket.emit("friend_messages", friendChats.get(chatId));
+    const messages = snap.docs.map((doc) => {
+      const data = doc.data();
+
+      return {
+        id: doc.id,
+        chatId: data.chatId,
+        senderId: data.senderId,
+        receiverId: data.receiverId,
+        text: data.text,
+        isRead: data.isRead ?? false,
+        createdAt: data.createdAt?.toMillis?.() ?? Date.now(),
+      };
     });
 
+    socket.emit("friend_messages", messages);
+  } catch (error) {
+    console.log("join_friend_chat error:", error);
+  }
+});
+
     // SEND MESSAGE 1-1
-    socket.on("send_friend_message", ({ currentUserId, friendId, text }) => {
+    socket.on("send_friend_message", async ({ currentUserId, friendId, text }) => {
       if (!currentUserId || !friendId || !text?.trim()) return;
 
+      const cleanText = text.trim();
       const chatId = getFriendChatId(currentUserId, friendId);
 
-      const message = {
-        id: Date.now().toString(),
-        senderId: currentUserId,
-        receiverId: friendId,
-        text: text.trim(),
-        createdAt: Date.now(),
-        isRead: false,
-      };
+      try {
+        const chatRef = db.collection("friend_chats").doc(chatId);
+        const msgRef = db.collection("friend_messages").doc();
 
-      if (!friendChats.has(chatId)) {
-        friendChats.set(chatId, []);
+        const now = admin.firestore.FieldValue.serverTimestamp();
+
+        await db.runTransaction(async (tx) => {
+          tx.set(
+            chatRef,
+            {
+              chatId,
+              users: [currentUserId, friendId],
+              lastMessage: cleanText,
+              lastMessageAt: now,
+              updatedAt: now,
+            },
+            { merge: true }
+          );
+
+          tx.set(msgRef, {
+            chatId,
+            senderId: currentUserId,
+            receiverId: friendId,
+            text: cleanText,
+            createdAt: now,
+            isRead: false,
+          });
+        });
+
+        io.to(chatId).emit("new_friend_message", {
+          id: msgRef.id,
+          chatId,
+          senderId: currentUserId,
+          receiverId: friendId,
+          text: cleanText,
+          createdAt: Date.now(),
+          isRead: false,
+        });
+      } catch (error) {
+        console.log("send_friend_message error:", error);
       }
-
-      const messages = friendChats.get(chatId);
-      messages.push(message);
-
-      if (messages.length > 100) {
-        messages.shift();
-      }
-
-      io.to(chatId).emit("new_friend_message", message);
     });
 
     // MARK READ
-    socket.on("mark_friend_messages_read", ({ currentUserId, friendId }) => {
-      if (!currentUserId || !friendId) return;
+    socket.on("mark_friend_messages_read", async ({ currentUserId, friendId }) => {
+  if (!currentUserId || !friendId) return;
 
-      const chatId = getFriendChatId(currentUserId, friendId);
-      const messages = friendChats.get(chatId) || [];
+  const chatId = getFriendChatId(currentUserId, friendId);
 
-      for (const msg of messages) {
-        if (msg.receiverId === currentUserId) {
-          msg.isRead = true;
-        }
-      }
+  try {
+    const snap = await db
+      .collection("friend_messages")
+      .where("chatId", "==", chatId)
+      .where("receiverId", "==", currentUserId)
+      .where("isRead", "==", false)
+      .get();
 
-      io.to(chatId).emit("friend_messages_read", {
-        chatId,
-        readerId: currentUserId,
+    const batch = db.batch();
+
+    snap.docs.forEach((doc) => {
+      batch.update(doc.ref, {
+        isRead: true,
       });
     });
+
+    await batch.commit();
+
+    io.to(chatId).emit("friend_messages_read", {
+      chatId,
+      readerId: currentUserId,
+    });
+  } catch (error) {
+    console.log("mark_friend_messages_read error:", error);
+  }
+});
 
     socket.on("disconnect", () => {
       const uid = socket.uid;
