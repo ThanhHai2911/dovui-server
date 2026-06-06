@@ -165,38 +165,30 @@ io.on("connection", (socket) => {
   });
 
   socket.on("join_friend_chat", async ({ currentUserId, friendId }) => {
-  if (!currentUserId || !friendId) return;
-
-  const chatId = getFriendChatId(currentUserId, friendId);
-  socket.join(chatId);
-
   try {
+    const chatId = getFriendChatId(currentUserId, friendId);
+
+    socket.join(chatId);
+
     const snap = await db
-      .collection("friend_messages")
-      .where("chatId", "==", chatId)
-      .limit(50)
+      .collection("friend_chats")
+      .doc(chatId)
+      .collection("messages")
+      .orderBy("createdAt", "desc")
+      .limit(30)
       .get();
 
-    const messages = snap.docs
-      .map((doc) => {
-        const data = doc.data();
+    const messages = snap.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data(),
+    }));
 
-        return {
-          id: doc.id,
-          chatId: data.chatId,
-          senderId: data.senderId,
-          receiverId: data.receiverId,
-          text: data.text,
-          isRead: data.isRead ?? false,
-          createdAt: data.createdAt?.toMillis?.() ?? Date.now(),
-        };
-      })
-      .sort((a, b) => b.createdAt - a.createdAt);
-
-    socket.emit("friend_messages", messages);
+    socket.emit("friend_chat_messages", messages.reverse());
   } catch (error) {
-    console.log("join_friend_chat error:", error);
-    socket.emit("friend_messages", []);
+    console.error("join_friend_chat error:", error);
+    socket.emit("friend_chat_error", {
+      message: "Không thể tải tin nhắn",
+    });
   }
 });
 
