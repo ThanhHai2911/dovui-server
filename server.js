@@ -165,20 +165,20 @@ io.on("connection", (socket) => {
   });
 
   socket.on("join_friend_chat", async ({ currentUserId, friendId }) => {
-    if (!currentUserId || !friendId) return;
+  if (!currentUserId || !friendId) return;
 
-    const chatId = getFriendChatId(currentUserId, friendId);
-    socket.join(chatId);
+  const chatId = getFriendChatId(currentUserId, friendId);
+  socket.join(chatId);
 
-    try {
-      const snap = await db
-        .collection("friend_messages")
-        .where("chatId", "==", chatId)
-        .orderBy("createdAt", "desc")
-        .limit(50)
-        .get();
+  try {
+    const snap = await db
+      .collection("friend_messages")
+      .where("chatId", "==", chatId)
+      .limit(50)
+      .get();
 
-      const messages = snap.docs.map((doc) => {
+    const messages = snap.docs
+      .map((doc) => {
         const data = doc.data();
 
         return {
@@ -190,13 +190,15 @@ io.on("connection", (socket) => {
           isRead: data.isRead ?? false,
           createdAt: data.createdAt?.toMillis?.() ?? Date.now(),
         };
-      });
+      })
+      .sort((a, b) => b.createdAt - a.createdAt);
 
-      socket.emit("friend_messages", messages);
-    } catch (error) {
-      console.log("join_friend_chat error:", error);
-    }
-  });
+    socket.emit("friend_messages", messages);
+  } catch (error) {
+    console.log("join_friend_chat error:", error);
+    socket.emit("friend_messages", []);
+  }
+});
 
   socket.on("send_friend_message", async ({ currentUserId, friendId, text }) => {
     if (!currentUserId || !friendId || !text?.trim()) return;
