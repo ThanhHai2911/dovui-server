@@ -175,6 +175,109 @@ io.on("connection", (socket) => {
 
     console.log("Disconnected:", socket.id);
   });
+
+  const friendChats = new Map();
+
+  function getFriendChatId(uid1, uid2) {
+    return [uid1, uid2].sort().join("_");
+  }
+
+  io.on("connection", (socket) => {
+    console.log("Connected:", socket.id);
+
+    socket.on("user_online", ({ uid }) => {
+      if (!uid) return;
+
+      socket.uid = uid;
+      addOnlineUser(uid, socket.id);
+
+      io.emit("user_status_changed", {
+        uid,
+        isOnline: true,
+      });
+
+      socket.emit("online_users", getOnlineUserIds());
+    });
+
+    // JOIN CHAT 1-1
+    socket.on("join_friend_chat", ({ currentUserId, friendId }) => {
+      if (!currentUserId || !friendId) return;
+
+      const chatId = getFriendChatId(currentUserId, friendId);
+      socket.join(chatId);
+
+      if (!friendChats.has(chatId)) {
+        friendChats.set(chatId, []);
+      }
+
+      socket.emit("friend_messages", friendChats.get(chatId));
+    });
+
+    // SEND MESSAGE 1-1
+    socket.on("send_friend_message", ({ currentUserId, friendId, text }) => {
+      if (!currentUserId || !friendId || !text?.trim()) return;
+
+      const chatId = getFriendChatId(currentUserId, friendId);
+
+      const message = {
+        id: Date.now().toString(),
+        senderId: currentUserId,
+        receiverId: friendId,
+        text: text.trim(),
+        createdAt: Date.now(),
+        isRead: false,
+      };
+
+      if (!friendChats.has(chatId)) {
+        friendChats.set(chatId, []);
+      }
+
+      const messages = friendChats.get(chatId);
+      messages.push(message);
+
+      if (messages.length > 100) {
+        messages.shift();
+      }
+
+      io.to(chatId).emit("new_friend_message", message);
+    });
+
+    // MARK READ
+    socket.on("mark_friend_messages_read", ({ currentUserId, friendId }) => {
+      if (!currentUserId || !friendId) return;
+
+      const chatId = getFriendChatId(currentUserId, friendId);
+      const messages = friendChats.get(chatId) || [];
+
+      for (const msg of messages) {
+        if (msg.receiverId === currentUserId) {
+          msg.isRead = true;
+        }
+      }
+
+      io.to(chatId).emit("friend_messages_read", {
+        chatId,
+        readerId: currentUserId,
+      });
+    });
+
+    socket.on("disconnect", () => {
+      const uid = socket.uid;
+
+      if (uid) {
+        const userReallyOffline = removeOnlineUser(uid, socket.id);
+
+        if (userReallyOffline) {
+          io.emit("user_status_changed", {
+            uid,
+            isOnline: false,
+          });
+        }
+      }
+
+      console.log("Disconnected:", socket.id);
+    });
+  });
 });
 
 const PORT = process.env.PORT || 3000;
