@@ -520,7 +520,18 @@ io.on("connection", (socket) => {
         });
 
         setTimeout(async () => {
-          await roomRef.delete();
+          const messagesSnap = await roomRef.collection("messages").get();
+
+          const batch = db.batch();
+
+          messagesSnap.forEach((doc) => {
+            batch.delete(doc.ref);
+          });
+
+          batch.delete(roomRef);
+
+          await batch.commit();
+
           rooms.delete(roomId);
           io.in(roomId).socketsLeave(roomId);
         }, 500);
