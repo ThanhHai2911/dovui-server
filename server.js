@@ -743,6 +743,44 @@ io.on("connection", (socket) => {
 
     console.log("Disconnected:", socket.id);
   });
+
+  socket.on("join-room-chat", ({ roomId }) => {
+    socket.join(`room_chat_${roomId}`);
+  });
+
+  socket.on("leave-room-chat", ({ roomId }) => {
+    socket.leave(`room_chat_${roomId}`);
+  });
+
+  socket.on("send-room-message", async (data) => {
+    const { roomId, userId, displayName, text } = data;
+
+    if (!roomId || !userId || !text?.trim()) return;
+
+    const now = new Date();
+
+    const messageForSocket = {
+      roomId,
+      userId,
+      displayName: displayName || "Ẩn danh",
+      text: text.trim(),
+      sentAt: now.toISOString(),
+    };
+
+    await db
+      .collection("rooms")
+      .doc(roomId)
+      .collection("messages")
+      .add({
+        userId,
+        displayName: displayName || "Ẩn danh",
+        text: text.trim(),
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+    io.to(`room_chat_${roomId}`).emit("room-message", messageForSocket);
+  });
+
 });
 app.get("/", (req, res) => {
   res.send("Dovui Server Running");
