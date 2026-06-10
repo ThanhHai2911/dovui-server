@@ -4,9 +4,26 @@ const cors = require("cors");
 const { Server } = require("socket.io");
 const { admin, db } = require("./firebase");
 
+
+const pool = require("./db");
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+app.get("/test-db", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT NOW()");
+    res.json({
+      success: true,
+      time: result.rows[0],
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
 
 const server = http.createServer(app);
 
@@ -134,135 +151,160 @@ io.on("connection", (socket) => {
 
       socket.join(chatId);
 
-      const snap = await db
-        .collection("friend_chats")
-        .doc(chatId)
-        .collection("messages")
-        .orderBy("createdAt", "desc")
-        .limit(50)
-        .get();
+      const result = await pool.query(
+        `
+  SELECT *
+  FROM messages
+  WHERE chat_id = $1
+  ORDER BY created_at DESC
+  LIMIT 50
+  `,
+        [chatId]
+      );
 
-      const messages = snap.docs.map((doc) => {
-        const data = doc.data();
-
-        return {
-          id: doc.id,
-          chatId,
-          senderId: data.senderId || "",
-          receiverId: data.receiverId || "",
-          text: data.text || "",
-          isRead: data.isRead || false,
-          createdAt: data.createdAt?.toMillis?.() || Date.now(),
-        };
-      });
+      const messages = result.rows.map((row) => ({
+        id: row.id.toString(),
+        chatId: row.chat_id,
+        senderId: row.sender_id,
+        receiverId: row.receiver_id,
+        text: row.text || "",
+        type: row.type || "text",
+        mediaUrl: row.media_url,
+        isRead: row.is_read === true,
+        createdAt: row.created_at
+          ? new Date(row.created_at).getTime()
+          : Date.now(),
+      }));
 
       socket.emit("friend_messages", messages);
     } catch (error) {
       console.error("join_friend_chat error:", error);
+
       socket.emit("friend_chat_error", {
         message: "Không thể tải tin nhắn",
       });
     }
   });
 
-  socket.on("send_friend_message", async ({ currentUserId, friendId, text }) => {
-    try {
-      if (!currentUserId || !friendId || !text?.trim()) return;
+  socket.on(
+    "send_friend_message",
+    async ({ currentUserId, friendId, text }) => {
+      try {
+        if (!currentUserId || !friendId || !text?.trim()) return;
 
-      const chatId = getFriendChatId(currentUserId, friendId);
+        const chatId = getFriendChatId(currentUserId, friendId);
 
-      const messageData = {
-        chatId,
-        senderId: currentUserId,
-        receiverId: friendId,
-        text: text.trim(),
-        isRead: false,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      };
+        const messageResult = await pool.query(
+          `
+        INSERT INTO messages
+        (
+          chat_id,
+          sender_id,
+          receiver_id,
+          text, 
+          type,
+          is_read
+        )
+        VALUES ($1,$2,$3,$4,$5,$6)
+        RETURNING *
+        `,
+          [
+            chatId,
+            currentUserId,
+            friendId,
+            text.trim(),
+            "text",
+            false,
+          ]
+        );
 
-      const docRef = await db
-        .collection("friend_chats")
-        .doc(chatId)
-        .collection("messages")
-        .add(messageData);
+        await pool.query(
+          `
+        INSERT INTO friend_chats
+        (
+          chat_id,
+          user1_id,
+          user2_id,
+          last_message,
+          updated_at
+        )
+        VALUES ($1,$2,$3,$4,NOW())
+        ON CONFLICT (chat_id)
+        DO UPDATE SET
+          last_message = EXCLUDED.last_message,
+          updated_at = NOW()
+        `,
+          [
+            chatId,
+            currentUserId,
+            friendId,
+            text.trim(),
+          ]
+        );
 
-      await db.collection("friend_chats").doc(chatId).set(
-        {
-          chatId,
-          members: [currentUserId, friendId],
-          lastMessage: text.trim(),
-          lastMessageAt: admin.firestore.FieldValue.serverTimestamp(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
+        const row = messageResult.rows[0];
 
-      const messageToSend = {
-        id: docRef.id,
-        chatId,
-        senderId: currentUserId,
-        receiverId: friendId,
-        text: text.trim(),
-        isRead: false,
-        createdAt: Date.now(),
-      };
+        const messageToSend = {
+          id: row.id.toString(),
+          chatId: row.chat_id,
+          senderId: row.sender_id,
+          receiverId: row.receiver_id,
+          text: row.text || "",
+          type: row.type || "text",
+          mediaUrl: row.media_url,
+          isRead: row.is_read === true,
+          createdAt: row.created_at
+            ? new Date(row.created_at).getTime()
+            : Date.now(),
+        };
 
-      io.to(chatId).emit("new_friend_message", messageToSend);
-    } catch (error) {
-      console.error("send_friend_message error:", error);
-    }
-  });
-
-  socket.on("mark_friend_messages_read", async ({ currentUserId, friendId }) => {
-    try {
-      const chatId = getFriendChatId(currentUserId, friendId);
-
-      const snap = await db
-        .collection("friend_chats")
-        .doc(chatId)
-        .collection("messages")
-        .where("receiverId", "==", currentUserId)
-        .where("isRead", "==", false)
-        .get();
-
-      const batch = db.batch();
-
-      snap.docs.forEach((doc) => {
-        batch.update(doc.ref, {
-          isRead: true,
-        });
-      });
-
-      await batch.commit();
-
-      io.to(chatId).emit("friend_messages_read", {
-        chatId,
-        readerId: currentUserId,
-      });
-    } catch (error) {
-      console.error("mark_friend_messages_read error:", error);
-    }
-  });
-
-  socket.on("disconnect", () => {
-    const uid = socket.uid;
-
-    if (uid) {
-      const userReallyOffline = removeOnlineUser(uid, socket.id);
-
-      if (userReallyOffline) {
-        io.emit("user_status_changed", {
-          uid,
-          isOnline: false,
-        });
+        io.to(chatId).emit(
+          "new_friend_message",
+          messageToSend
+        );
+      } catch (error) {
+        console.error("send_friend_message error:", error);
       }
     }
+  );
 
-    console.log("Disconnected:", socket.id);
-  });
+  socket.on(
+    "mark_friend_messages_read",
+    async ({ currentUserId, friendId }) => {
+      try {
+        const chatId = getFriendChatId(
+          currentUserId,
+          friendId
+        );
+
+        await pool.query(
+          `
+        UPDATE messages
+        SET is_read = true
+        WHERE chat_id = $1
+        AND receiver_id = $2
+        AND is_read = false
+        `,
+          [chatId, currentUserId]
+        );
+
+        io.to(chatId).emit(
+          "friend_messages_read",
+          {
+            chatId,
+            readerId: currentUserId,
+          }
+        );
+      } catch (error) {
+        console.error(
+          "mark_friend_messages_read error:",
+          error
+        );
+      }
+    }
+  );
 
   //ROOM EVENTS
-
   // =========================
   // CREATE GAME ROOM
   // =========================
