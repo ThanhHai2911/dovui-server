@@ -217,6 +217,56 @@ async function importFriendChats() {
   console.log(`Imported friend_chats: ${chatsSnap.size}`);
 }
 
+async function importLevelUser() {
+  console.log("Import level_user...");
+
+  const snap = await db.collection("level_user").get();
+
+  for (const doc of snap.docs) {
+    await pool.query(
+      `
+      INSERT INTO level_user
+      (uid, data)
+      VALUES ($1,$2)
+      ON CONFLICT (uid)
+      DO UPDATE SET
+      data = EXCLUDED.data
+      `,
+      [
+        doc.id,
+        JSON.stringify(doc.data()),
+      ]
+    );
+  }
+
+  console.log(`Imported level_user: ${snap.size}`);
+}
+
+async function importUserVip() {
+  console.log("Import user_vip...");
+
+  const snap = await db.collection("user_vip").get();
+
+  for (const doc of snap.docs) {
+    await pool.query(
+      `
+      INSERT INTO user_vip
+      (uid, data)
+      VALUES ($1,$2)
+      ON CONFLICT (uid)
+      DO UPDATE SET
+      data = EXCLUDED.data
+      `,
+      [
+        doc.id,
+        JSON.stringify(doc.data()),
+      ]
+    );
+  }
+
+  console.log(`Imported user_vip: ${snap.size}`);
+}
+
 async function main() {
   try {
     console.log("Migration started...");
@@ -226,6 +276,9 @@ async function main() {
     await importFriends();
     await importFriendRequests();
     await importFriendChats();
+
+    await importLevelUser();
+    await importUserVip();
 
     console.log("Migration completed.");
   } catch (error) {
