@@ -822,3 +822,273 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Server running on ${PORT}`);
 });
+
+// =========================
+// SYNC USER FROM FIREBASE TO POSTGRES
+// =========================
+
+app.post("/users/sync", async (req, res) => {
+  try {
+    const {
+      uid,
+      name,
+      email,
+      avatar = "",
+      loginType = "email",
+    } = req.body;
+
+    if (!uid || !email) {
+      return res.status(400).json({
+        success: false,
+        message: "Thiếu uid hoặc email",
+      });
+    }
+
+    const playerId = uid.substring(0, 8).toUpperCase();
+
+    const result = await pool.query(
+      `
+      INSERT INTO users
+      (
+        uid,
+        name,
+        email,
+        player_id,
+        avatar,
+        score,
+        rank,
+        stars,
+        is_vip,
+        is_admin,
+        is_online,
+        created_at,
+        updated_at
+      )
+      VALUES
+      ($1,$2,$3,$4,$5,300,0,0,false,false,false,NOW(),NOW())
+      ON CONFLICT (uid)
+      DO UPDATE SET
+        name = EXCLUDED.name,
+        email = EXCLUDED.email,
+        avatar = EXCLUDED.avatar,
+        updated_at = NOW()
+      RETURNING *
+      `,
+      [
+        uid,
+        name || "",
+        email || "",
+        playerId,
+        avatar || "",
+      ]
+    );
+
+    res.json({
+      success: true,
+      user: result.rows[0],
+    });
+  } catch (e) {
+    console.error("sync user error:", e);
+    res.status(500).json({
+      success: false,
+      message: e.message,
+    });
+  }
+});
+
+// =========================
+// CHECK IF USERNAME EXISTS
+// =========================
+
+app.get("/users/check-name", async (req, res) => {
+  try {
+    const name = req.query.name?.trim();
+
+    if (!name) {
+      return res.json({ exists: false });
+    }
+
+    const result = await pool.query(
+      "SELECT uid FROM users WHERE LOWER(name) = LOWER($1) LIMIT 1",
+      [name]
+    );
+
+    res.json({
+      exists: result.rows.length > 0,
+    });
+  } catch (e) {
+    res.status(500).json({
+      exists: false,
+      message: e.message,
+    });
+  }
+});
+
+// =========================
+// GET USER BY UID
+// =========================
+
+app.post("/users/sync", async (req, res) => {
+  try {
+    const { uid, name, email, avatar = "" } = req.body;
+
+    if (!uid || !email) {
+      return res.status(400).json({
+        success: false,
+        message: "Thiếu uid hoặc email",
+      });
+    }
+
+    const playerId = uid.substring(0, 8).toUpperCase();
+
+    const result = await pool.query(
+      `
+      INSERT INTO users
+      (
+        uid,
+        name,
+        email,
+        player_id,
+        avatar,
+        score,
+        rank,
+        stars,
+        is_vip,
+        is_admin,
+        is_online,
+        created_at,
+        updated_at
+      )
+      VALUES
+      ($1,$2,$3,$4,$5,300,0,0,false,false,false,NOW(),NOW())
+      ON CONFLICT (uid)
+      DO UPDATE SET
+        name = EXCLUDED.name,
+        email = EXCLUDED.email,
+        avatar = EXCLUDED.avatar,
+        updated_at = NOW()
+      RETURNING *
+      `,
+      [uid, name || "", email || "", playerId, avatar || ""]
+    );
+
+    res.json({
+      success: true,
+      user: result.rows[0],
+    });
+  } catch (e) {
+    console.error("sync user error:", e);
+    res.status(500).json({
+      success: false,
+      message: e.message,
+    });
+  }
+});
+
+// =========================
+// GET USER BY UID
+// =========================
+
+app.get("/users/:uid", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM users WHERE uid = $1 LIMIT 1",
+      [req.params.uid]
+    );
+
+    res.json({
+      user: result.rows[0] || null,
+    });
+  } catch (e) {
+    res.status(500).json({
+      user: null,
+      message: e.message,
+    });
+  }
+});
+
+// =========================
+// UPDATE USER SCORE
+// =========================
+
+app.patch("/users/:uid/score", async (req, res) => {
+  try {
+    const { score } = req.body;
+
+    await pool.query(
+      "UPDATE users SET score = $1, updated_at = NOW() WHERE uid = $2",
+      [score, req.params.uid]
+    );
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({
+      success: false,
+      message: e.message,
+    });
+  }
+});
+
+// =========================
+// GET LEADERBOARD
+// =========================
+
+app.get("/users/leaderboard", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM users
+      ORDER BY score DESC
+      LIMIT 10
+      `
+    );
+
+    res.json({
+      users: result.rows,
+    });
+  } catch (e) {
+    res.status(500).json({
+      users: [],
+      message: e.message,
+    });
+  }
+});
+
+// =========================
+// GET USER COUNT
+// =========================
+
+app.get("/users/count", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT COUNT(*) FROM users");
+
+    res.json({
+      count: Number(result.rows[0].count),
+    });
+  } catch (e) {
+    res.status(500).json({
+      count: 0,
+      message: e.message,
+    });
+  }
+});
+
+// =========================
+// DELETE USER (FOR TESTING)
+// =========================
+
+app.delete("/users/:uid", async (req, res) => {
+  try {
+    await pool.query("DELETE FROM users WHERE uid = $1", [req.params.uid]);
+
+    res.json({
+      success: true,
+    });
+  } catch (e) {
+    res.status(500).json({
+      success: false,
+      message: e.message,
+    });
+  }
+});
