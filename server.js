@@ -986,6 +986,43 @@ app.post("/users/sync", async (req, res) => {
 });
 
 // =========================
+// GET USER BY NAME
+// =========================
+
+app.get("/users/by-name/:name", async (req, res) => {
+  try {
+    const name = req.params.name?.trim();
+
+    if (!name) {
+      return res.status(400).json({
+        user: null,
+        message: "Thiếu tên đăng nhập",
+      });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM users
+      WHERE LOWER(name) = LOWER($1)
+      LIMIT 1
+      `,
+      [name]
+    );
+
+    res.json({
+      user: result.rows[0] || null,
+    });
+  } catch (e) {
+    console.error("get user by name error:", e);
+    res.status(500).json({
+      user: null,
+      message: e.message,
+    });
+  }
+});
+
+// =========================
 // GET USER BY UID
 // =========================
 
