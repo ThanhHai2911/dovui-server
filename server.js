@@ -1316,10 +1316,12 @@ app.get("/users/leaderboard", async (req, res) => {
         RANK() OVER (ORDER BY score DESC) AS rank
       FROM users
       ORDER BY score DESC
-      LIMIT 20
+      LIMIT 10
     `);
 
-    res.json({ users: result.rows });
+    res.json({
+      users: result.rows
+    });
   } catch (err) {
     console.error("LEADERBOARD ERROR:", err);
     res.status(500).json({ error: err.message });
