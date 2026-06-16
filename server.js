@@ -1129,3 +1129,89 @@ app.delete("/users/:uid", async (req, res) => {
     });
   }
 });
+
+// =========================
+// CHECK IF PLAYER ID EXISTS
+// =========================
+
+app.get("/users/check-player-id", async (req, res) => {
+  try {
+    const { playerId } = req.query;
+
+    if (!playerId) {
+      return res.status(400).json({ error: "MISSING_PLAYER_ID" });
+    }
+
+    const result = await pool.query(
+      "SELECT uid FROM users WHERE LOWER(player_id) = LOWER($1) LIMIT 1",
+      [playerId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ exists: false, uid: null });
+    }
+
+    return res.json({
+      exists: true,
+      uid: result.rows[0].uid,
+    });
+  } catch (err) {
+    console.error("CHECK PLAYER ID ERROR:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// =========================
+// UPDATE USER PROFILE
+// =========================
+
+app.patch("/users/:uid/profile", async (req, res) => {
+  try {
+    const { uid } = req.params;
+    const name = req.body.name;
+    const playerId = req.body.playerId || req.body.player_id;
+    const avatar = req.body.avatar || "";
+
+    if (!name || !playerId) {
+      return res.status(400).json({ error: "MISSING_FIELDS" });
+    }
+
+    const existing = await pool.query(
+      `
+      SELECT uid 
+      FROM users 
+      WHERE LOWER(player_id) = LOWER($1) 
+      AND uid <> $2
+      LIMIT 1
+      `,
+      [playerId, uid]
+    );
+
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: "PLAYER_ID_EXISTS" });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET 
+        name = $1,
+        player_id = $2,
+        avatar = $3,
+        updated_at = NOW()
+      WHERE uid = $4
+      RETURNING *
+      `,
+      [name, playerId, avatar, uid]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "USER_NOT_FOUND" });
+    }
+
+    return res.json({ user: result.rows[0] });
+  } catch (err) {
+    console.error("UPDATE PROFILE ERROR:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
