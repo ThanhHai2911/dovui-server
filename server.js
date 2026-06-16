@@ -186,6 +186,11 @@ io.on("connection", (socket) => {
   // SEND FRIEND MESSAGE
   // =========================
   socket.on("send_friend_message", async ({ currentUserId, friendId, text }) => {
+    console.log("🔥 SEND FRIEND MESSAGE EVENT HIT:", {
+    currentUserId,
+    friendId,
+    text,
+  });
     if (!currentUserId || !friendId || !text?.trim()) return;
 
     const chatId = getFriendChatId(currentUserId, friendId);
@@ -200,7 +205,7 @@ io.on("connection", (socket) => {
       }
       return false;
     })();
-
+    console.log("🔥 INSERT TO POSTGRES:", chatId);
     const result = await pool.query(
       `
     INSERT INTO messages
@@ -217,6 +222,7 @@ io.on("connection", (socket) => {
         receiverInChat,
       ]
     );
+    console.log("✅ INSERT SUCCESS:", result.rows[0]);
 
     await pool.query(
       `
