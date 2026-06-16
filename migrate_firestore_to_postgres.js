@@ -1,5 +1,19 @@
 const { db } = require("./firebase");
 const pool = require("./db");
+async function checkDb() {
+  const dbName = await pool.query("SELECT current_database()");
+  const table = await pool.query(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_name = 'users'
+    ORDER BY ordinal_position
+  `);
+
+  console.log("DATABASE:", dbName.rows[0].current_database);
+  console.log("USERS COLUMNS:", table.rows.map(r => r.column_name));
+}
+
+checkDb();
 
 async function migrateUsers() {
   try {
