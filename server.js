@@ -145,144 +145,35 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("room_updated", room);
   });
 
-// =========================
-// JOIN FRIEND CHAT
-// =========================
-socket.on("join_friend_chat", async ({ currentUserId, friendId }) => {
-  try {
-    if (!currentUserId || !friendId) return;
+  // =========================
+  // JOIN FRIEND CHAT
+  // =========================
+  socket.on("join_friend_chat", async ({ currentUserId, friendId }) => {
+    try {
+      if (!currentUserId || !friendId) return;
 
-    const chatId = getFriendChatId(currentUserId, friendId);
+      const chatId = getFriendChatId(currentUserId, friendId);
 
-    // Rời chat cũ nếu có (tránh join nhiều room)
-    if (socket.activeChatId && socket.activeChatId !== chatId) {
-      socket.leave(socket.activeChatId);
-    }
+      // Rời chat cũ nếu có (tránh join nhiều room)
+      if (socket.activeChatId && socket.activeChatId !== chatId) {
+        socket.leave(socket.activeChatId);
+      }
 
-    socket.join(chatId);
-    socket.activeChatId = chatId;
+      socket.join(chatId);
+      socket.activeChatId = chatId;
 
-    const result = await pool.query(
-      `
+      const result = await pool.query(
+        `
       SELECT *
       FROM messages
       WHERE chat_id = $1
       ORDER BY created_at DESC
       LIMIT 50
       `,
-      [chatId]
-    );
-
-    const messages = result.rows.map((row) => ({
-      id: row.id.toString(),
-      chatId: row.chat_id,
-      senderId: row.sender_id,
-      receiverId: row.receiver_id,
-      text: row.text || "",
-      type: row.type || "text",
-      mediaUrl: row.media_url || "",
-      isRead: row.is_read === true,
-      createdAt: row.created_at
-        ? new Date(row.created_at).getTime()
-        : Date.now(),
-    }));
-
-    socket.emit("friend_messages", messages);
-
-    // Mark tin nhắn gửi cho mình là đã đọc khi vào chat
-    await pool.query(
-      `
-      UPDATE messages
-      SET is_read = true
-      WHERE chat_id = $1
-      AND receiver_id = $2
-      AND is_read = false
-      `,
-      [chatId, currentUserId]
-    );
-
-    // Thông báo cho người kia biết tin đã đọc
-    socket.to(chatId).emit("friend_messages_read", {
-      chatId,
-      readerId: currentUserId,
-    });
-
-  } catch (error) {
-    console.error("join_friend_chat error:", error);
-    socket.emit("friend_chat_error", {
-      message: "Không thể tải tin nhắn",
-    });
-  }
-});
-
-// =========================
-// SEND FRIEND MESSAGE
-// =========================
-socket.on(
-  "send_friend_message",
-  async ({ currentUserId, friendId, text }) => {
-    console.log("SEND FRIEND MESSAGE:", {
-      currentUserId,
-      friendId,
-      text,
-    });
-
-    try {
-      if (!currentUserId || !friendId || !text?.trim()) {
-        console.log("SEND FRIEND MESSAGE FAILED: missing data");
-        return;
-      }
-
-      const chatId = getFriendChatId(currentUserId, friendId);
-
-      console.log("CHAT ID:", chatId);
-
-      const receiverOnline = onlineUsers.has(friendId);
-      const receiverInChat = receiverOnline && (() => {
-        const sockets = onlineUsers.get(friendId);
-        for (const sid of sockets) {
-          const s = io.sockets.sockets.get(sid);
-          if (s?.activeChatId === chatId) return true;
-        }
-        return false;
-      })();
-
-      const messageResult = await pool.query(
-        `
-        INSERT INTO messages
-        (chat_id, sender_id, receiver_id, text, type, is_read)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING *
-        `,
-        [
-          chatId,
-          currentUserId,
-          friendId,
-          text.trim(),
-          "text",
-          receiverInChat,
-        ]
+        [chatId]
       );
 
-      console.log("INSERT MESSAGE SUCCESS:", messageResult.rows[0]);
-
-      await pool.query(
-        `
-        INSERT INTO friend_chats (chat_id, user1_id, user2_id, last_message, updated_at)
-        VALUES ($1, $2, $3, $4, NOW())
-        ON CONFLICT (chat_id)
-        DO UPDATE SET
-          last_message = EXCLUDED.last_message,
-          updated_at = NOW()
-        `,
-        [chatId, currentUserId, friendId, text.trim()]
-      );
-
-      console.log("UPSERT FRIEND_CHAT SUCCESS");
-
-      const row = messageResult.rows[0];
-
-      const messageToSend = {
+      const messages = result.rows.map((row) => ({
         id: row.id.toString(),
         chatId: row.chat_id,
         senderId: row.sender_id,
@@ -294,39 +185,148 @@ socket.on(
         createdAt: row.created_at
           ? new Date(row.created_at).getTime()
           : Date.now(),
-      };
+      }));
 
-      io.to(chatId).emit("new_friend_message", messageToSend);
+      socket.emit("friend_messages", messages);
 
-      if (receiverOnline && !receiverInChat) {
-        const sockets = onlineUsers.get(friendId);
-        for (const sid of sockets) {
-          io.to(sid).emit("new_message_notification", {
-            chatId,
-            senderId: currentUserId,
-            text: text.trim(),
-          });
-        }
-      }
-    } catch (error) {
-      console.error("send_friend_message error:", error);
-    }
-  }
-);
-
-// =========================
-// MARK MESSAGES READ
-// =========================
-socket.on(
-  "mark_friend_messages_read",
-  async ({ currentUserId, friendId }) => {
-    try {
-      if (!currentUserId || !friendId) return;
-
-      const chatId = getFriendChatId(currentUserId, friendId);
-
-      const result = await pool.query(
+      // Mark tin nhắn gửi cho mình là đã đọc khi vào chat
+      await pool.query(
         `
+      UPDATE messages
+      SET is_read = true
+      WHERE chat_id = $1
+      AND receiver_id = $2
+      AND is_read = false
+      `,
+        [chatId, currentUserId]
+      );
+
+      // Thông báo cho người kia biết tin đã đọc
+      socket.to(chatId).emit("friend_messages_read", {
+        chatId,
+        readerId: currentUserId,
+      });
+
+    } catch (error) {
+      console.error("join_friend_chat error:", error);
+      socket.emit("friend_chat_error", {
+        message: "Không thể tải tin nhắn",
+      });
+    }
+  });
+
+  // =========================
+  // SEND FRIEND MESSAGE
+  // =========================
+  socket.on(
+    "send_friend_message",
+    async ({ currentUserId, friendId, text }) => {
+      console.log("SEND FRIEND MESSAGE:", {
+        currentUserId,
+        friendId,
+        text,
+      });
+
+      try {
+        if (!currentUserId || !friendId || !text?.trim()) {
+          console.log("SEND FRIEND MESSAGE FAILED: missing data");
+          return;
+        }
+
+        const chatId = getFriendChatId(currentUserId, friendId);
+
+        console.log("CHAT ID:", chatId);
+
+        const receiverOnline = onlineUsers.has(friendId);
+        const receiverInChat = receiverOnline && (() => {
+          const sockets = onlineUsers.get(friendId);
+          for (const sid of sockets) {
+            const s = io.sockets.sockets.get(sid);
+            if (s?.activeChatId === chatId) return true;
+          }
+          return false;
+        })();
+
+        const messageResult = await pool.query(
+          `
+        INSERT INTO messages
+        (chat_id, sender_id, receiver_id, text, type, is_read)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING *
+        `,
+          [
+            chatId,
+            currentUserId,
+            friendId,
+            text.trim(),
+            "text",
+            receiverInChat,
+          ]
+        );
+
+        console.log("INSERT MESSAGE SUCCESS:", messageResult.rows[0]);
+
+        await pool.query(
+          `
+        INSERT INTO friend_chats (chat_id, user1_id, user2_id, last_message, updated_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        ON CONFLICT (chat_id)
+        DO UPDATE SET
+          last_message = EXCLUDED.last_message,
+          updated_at = NOW()
+        `,
+          [chatId, currentUserId, friendId, text.trim()]
+        );
+
+        console.log("UPSERT FRIEND_CHAT SUCCESS");
+
+        const row = messageResult.rows[0];
+
+        const messageToSend = {
+          id: row.id.toString(),
+          chatId: row.chat_id,
+          senderId: row.sender_id,
+          receiverId: row.receiver_id,
+          text: row.text || "",
+          type: row.type || "text",
+          mediaUrl: row.media_url || "",
+          isRead: row.is_read === true,
+          createdAt: row.created_at
+            ? new Date(row.created_at).getTime()
+            : Date.now(),
+        };
+
+        io.to(chatId).emit("new_friend_message", messageToSend);
+
+        if (receiverOnline && !receiverInChat) {
+          const sockets = onlineUsers.get(friendId);
+          for (const sid of sockets) {
+            io.to(sid).emit("new_message_notification", {
+              chatId,
+              senderId: currentUserId,
+              text: text.trim(),
+            });
+          }
+        }
+      } catch (error) {
+        console.error("send_friend_message error:", error);
+      }
+    }
+  );
+
+  // =========================
+  // MARK MESSAGES READ
+  // =========================
+  socket.on(
+    "mark_friend_messages_read",
+    async ({ currentUserId, friendId }) => {
+      try {
+        if (!currentUserId || !friendId) return;
+
+        const chatId = getFriendChatId(currentUserId, friendId);
+
+        const result = await pool.query(
+          `
         UPDATE messages
         SET is_read = true
         WHERE chat_id = $1
@@ -334,21 +334,21 @@ socket.on(
         AND is_read = false
         RETURNING id
         `,
-        [chatId, currentUserId]
-      );
+          [chatId, currentUserId]
+        );
 
-      // Chỉ emit nếu thực sự có tin nhắn được update
-      if (result.rowCount > 0) {
-        io.to(chatId).emit("friend_messages_read", {
-          chatId,
-          readerId: currentUserId,
-        });
+        // Chỉ emit nếu thực sự có tin nhắn được update
+        if (result.rowCount > 0) {
+          io.to(chatId).emit("friend_messages_read", {
+            chatId,
+            readerId: currentUserId,
+          });
+        }
+      } catch (error) {
+        console.error("mark_friend_messages_read error:", error);
       }
-    } catch (error) {
-      console.error("mark_friend_messages_read error:", error);
     }
-  }
-);
+  );
 
   //ROOM EVENTS
   // =========================
@@ -356,8 +356,6 @@ socket.on(
   // =========================
   socket.on("create_game_room", async (data, callback) => {
     try {
-      console.log("CREATE GAME ROOM:", data);
-
       const {
         uid,
         displayName,
@@ -376,15 +374,9 @@ socket.on(
         });
       }
 
-      let roomId = generateRoomId();
+      const now = Date.now();
 
-      while ((await db.collection("rooms").doc(roomId).get()).exists) {
-        roomId = generateRoomId();
-      }
-
-      const roomRef = db.collection("rooms").doc(roomId);
-
-      const roomData = {
+      const { roomId, roomData } = await createRoomWithRetry((roomId) => ({
         roomId,
         hostId: uid,
         hostName: displayName,
@@ -407,27 +399,29 @@ socket.on(
             isHost: true,
             isReady: true,
             isFinished: false,
-            joinedAt: Date.now(),
+            joinedAt: now,
           },
         ],
-      };
-
-      await roomRef.set(roomData);
+      }));
 
       socket.join(roomId);
+
+      const roomForClient = {
+        ...roomData,
+        createdAt: now,
+        updatedAt: now,
+      };
 
       callback?.({
         success: true,
         roomId,
+        room: roomForClient,
       });
 
-      io.to(roomId).emit("room_updated", {
-        ...roomData,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      });
+      io.to(roomId).emit("room_updated", roomForClient);
     } catch (error) {
       console.error("create_game_room error:", error);
+
       callback?.({
         success: false,
         message: "Không thể tạo phòng",
@@ -440,8 +434,6 @@ socket.on(
   // =========================
   socket.on("join_game_room", async (data, callback) => {
     try {
-      console.log("JOIN GAME ROOM:", data);
-
       const {
         roomId,
         uid,
@@ -457,7 +449,10 @@ socket.on(
         });
       }
 
-      const roomRef = db.collection("rooms").doc(roomId);
+      const cleanRoomId = roomId.trim().toUpperCase();
+      const roomRef = db.collection("rooms").doc(cleanRoomId);
+
+      let latestRoom = null;
 
       await db.runTransaction(async (transaction) => {
         const snap = await transaction.get(roomRef);
@@ -480,7 +475,7 @@ socket.on(
           throw new Error("NOT_INVITED");
         }
 
-        if (!isDirectJoin && room.password && room.password !== password) {
+        if (!isDirectJoin && room.password && room.password !== password.trim()) {
           throw new Error("WRONG_PASSWORD");
         }
 
@@ -490,12 +485,11 @@ socket.on(
           throw new Error("ROOM_FULL");
         }
 
-        const exists = players.some((p) => p.userId === uid);
+        const alreadyInRoom = players.some((p) => p.userId === uid);
 
-        let newPlayers = players;
-
-        if (!exists) {
-          newPlayers = [
+        const newPlayers = alreadyInRoom
+          ? players
+          : [
             ...players,
             {
               userId: uid,
@@ -507,11 +501,18 @@ socket.on(
               joinedAt: Date.now(),
             },
           ];
-        }
 
         const kickedUserIds = Array.isArray(room.kickedUserIds)
           ? room.kickedUserIds.filter((id) => id !== uid)
           : [];
+
+        latestRoom = {
+          ...room,
+          roomId: cleanRoomId,
+          players: newPlayers,
+          kickedUserIds,
+          updatedAt: Date.now(),
+        };
 
         transaction.update(roomRef, {
           players: newPlayers,
@@ -520,20 +521,15 @@ socket.on(
         });
       });
 
-      const latestSnap = await roomRef.get();
-      const latestRoom = latestSnap.data();
-
-      socket.join(roomId);
+      socket.join(cleanRoomId);
 
       callback?.({
         success: true,
-        roomId,
+        roomId: cleanRoomId,
+        room: latestRoom,
       });
 
-      io.to(roomId).emit("room_updated", {
-        ...latestRoom,
-        updatedAt: Date.now(),
-      });
+      io.to(cleanRoomId).emit("room_updated", latestRoom);
     } catch (error) {
       console.error("join_game_room error:", error.message);
 
@@ -541,21 +537,13 @@ socket.on(
 
       if (error.message === "ROOM_NOT_FOUND") {
         message = "Phòng không tồn tại";
-      }
-
-      if (error.message === "ROOM_NOT_WAITING") {
+      } else if (error.message === "ROOM_NOT_WAITING") {
         message = "Phòng đã bắt đầu";
-      }
-
-      if (error.message === "WRONG_PASSWORD") {
+      } else if (error.message === "WRONG_PASSWORD") {
         message = "Sai mật khẩu";
-      }
-
-      if (error.message === "NOT_INVITED") {
+      } else if (error.message === "NOT_INVITED") {
         message = "Bạn không có quyền tham gia phòng này";
-      }
-
-      if (error.message === "ROOM_FULL") {
+      } else if (error.message === "ROOM_FULL") {
         message = "Phòng đã đầy";
       }
 
