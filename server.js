@@ -25,6 +25,10 @@ app.get("/test-db", async (req, res) => {
   }
 });
 
+pool.query("SELECT NOW()")
+  .then(() => console.log("POSTGRES CONNECTED"))
+  .catch(err => console.error("POSTGRES ERROR", err));
+
 const server = http.createServer(app);
 
 const io = new Server(server, {
