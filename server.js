@@ -1307,3 +1307,30 @@ app.post("/users/:uid/watch-video-reward", async (req, res) => {
   }
 });
 
+app.get("/users/:uid/home", async (req, res) => {
+  const { uid } = req.params;
+
+  const result = await pool.query(
+    `SELECT name, score, created_at
+     FROM users
+     WHERE uid = $1`,
+    [uid]
+  );
+
+  if (result.rows.length === 0) {
+    return res.status(404).json({ message: "USER_NOT_FOUND" });
+  }
+
+  const user = result.rows[0];
+
+  const days = Math.floor(
+    (new Date() - new Date(user.created_at)) / (1000 * 60 * 60 * 24)
+  );
+
+  res.json({
+    name: user.name,
+    score: user.score,
+    days: days,
+  });
+});
+
