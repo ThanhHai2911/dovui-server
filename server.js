@@ -1215,3 +1215,84 @@ app.patch("/users/:uid/profile", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+
+app.patch("/users/:uid/vip", async (req, res) => {
+  const { uid } = req.params;
+
+  const result = await pool.query(
+    `
+    UPDATE users
+    SET is_vip = true,
+        updated_at = NOW()
+    WHERE uid = $1
+    RETURNING *
+    `,
+    [uid]
+  );
+
+  if (result.rows.length === 0) {
+    return res.status(404).json({ error: "USER_NOT_FOUND" });
+  }
+
+  res.json({ user: result.rows[0] });
+});
+
+//
+
+app.post("/users/:uid/check-in", async (req, res) => {
+  try {
+    const { uid } = req.params;
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET score = score + 10,
+          stars = stars + 10,
+          last_check_in = CURRENT_DATE,
+          updated_at = NOW()
+      WHERE uid = $1
+        AND (last_check_in IS NULL OR last_check_in < CURRENT_DATE)
+      RETURNING *
+      `,
+      [uid]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(400).json({ error: "ALREADY_CHECKED_IN" });
+    }
+
+    res.json({ user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+app.post("/users/:uid/watch-video-reward", async (req, res) => {
+  try {
+    const { uid } = req.params;
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET score = score + 10,
+          stars = stars + 10,
+          last_video_watch = CURRENT_DATE,
+          updated_at = NOW()
+      WHERE uid = $1
+        AND (last_video_watch IS NULL OR last_video_watch < CURRENT_DATE)
+      RETURNING *
+      `,
+      [uid]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(400).json({ error: "ALREADY_WATCHED_VIDEO" });
+    }
+
+    res.json({ user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
