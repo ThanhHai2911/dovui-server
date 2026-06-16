@@ -1004,7 +1004,7 @@ app.get("/users/by-name/:name", async (req, res) => {
       `
       SELECT *
       FROM users
-      WHERE LOWER(name) = LOWER($1)
+      WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))
       LIMIT 1
       `,
       [name]
