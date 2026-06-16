@@ -1296,3 +1296,27 @@ app.post("/users/:uid/watch-video-reward", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// 
+
+app.get("/users/leaderboard", async (req, res) => {
+  const result = await pool.query(`
+    SELECT
+      uid,
+      name,
+      email,
+      player_id,
+      avatar,
+      score,
+      stars,
+      is_vip,
+      is_admin,
+      created_at,
+      RANK() OVER (ORDER BY score DESC) AS rank
+    FROM users
+    ORDER BY score DESC
+    LIMIT 20
+  `);
+
+  res.json({ users: result.rows });
+});
