@@ -982,7 +982,13 @@ io.on("connection", (socket) => {
       if (!room) return;
 
       const players = room.players.map((p) =>
-        p.userId === uid ? { ...p, isReady } : p
+        p.userId === uid
+          ? {
+            ...p,
+            isReady,
+            isFinished: isReady ? false : p.isFinished,
+          }
+          : p
       );
 
       await pool.query(
@@ -1005,6 +1011,14 @@ io.on("connection", (socket) => {
     try {
       const room = await getGameRoom(roomId);
       if (!room) return;
+
+      const allFinished = room.players.every((p) => p.isFinished === false);
+      const allReady = room.players.every((p) => p.isHost || p.isReady === true);
+
+      if (!allFinished || !allReady || room.players.length < 2) {
+        await emitRoomUpdated(roomId);
+        return;
+      }
 
       const startedAt = Date.now();
 
@@ -1067,18 +1081,32 @@ io.on("connection", (socket) => {
       const room = await getGameRoom(roomId);
       if (!room) return;
 
+      const currentPlayer = room.players.find((p) => p.userId === uid);
+      if (!currentPlayer) return;
+
+      const isHostFinished = currentPlayer.isHost === true;
+
       const players = room.players.map((p) =>
-        p.userId === uid ? { ...p, isFinished: true } : p
+        p.userId === uid
+          ? {
+            ...p,
+            isFinished: true,
+          }
+          : p
       );
+
+      // Nếu host hoàn thành thì chuyển phòng về waiting ngay
+      const nextStatus = isHostFinished ? "waiting" : room.status;
 
       await pool.query(
         `
-        UPDATE game_rooms
-        SET players = $1::jsonb,
-            updated_at = NOW()
-        WHERE room_id = $2
-        `,
-        [JSON.stringify(players), roomId]
+      UPDATE game_rooms
+      SET players = $1::jsonb,
+          status = $2,
+          updated_at = NOW()
+      WHERE room_id = $3
+      `,
+        [JSON.stringify(players), nextStatus, roomId]
       );
 
       await emitRoomUpdated(roomId);
