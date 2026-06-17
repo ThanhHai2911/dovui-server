@@ -337,6 +337,25 @@ async function emitLeaderboardIfChanged(beforeTop) {
   return afterTop;
 }
 
+async function getUserByUid(uid) {
+  const result = await pool.query(
+    `
+    SELECT uid, name, avatar
+    FROM users
+    WHERE uid = $1
+    LIMIT 1
+    `,
+    [uid]
+  );
+
+  const user = result.rows[0];
+
+  return {
+    name: user?.name || "Người chơi",
+    avatar: user?.avatar || "",
+  };
+}
+
 // =========================
 // SOCKET EVENTS
 // =========================
@@ -404,10 +423,16 @@ io.on("connection", (socket) => {
         });
       }
 
-      const user = await getUserLite(uid);
       const now = Date.now();
 
-      const finalDisplayName = displayName || user.name;
+      const userInfo = await getUserByUid(uid);
+
+      const finalDisplayName =
+        userInfo.name && userInfo.name !== "Ẩn danh"
+          ? userInfo.name
+          : displayName || "Người chơi";
+
+      const finalAvatar = userInfo.avatar || "";
 
       const { roomId, roomData } = await createRoomWithRetry((newRoomId) => ({
         roomId: newRoomId,
@@ -525,27 +550,27 @@ io.on("connection", (socket) => {
 
       const newPlayers = alreadyInRoom
         ? room.players.map((p) =>
-            p.userId === uid
-              ? {
-                  ...p,
-                  displayName: p.displayName || finalDisplayName,
-                  avatar: p.avatar || user.avatar,
-                }
-              : p
-          )
+          p.userId === uid
+            ? {
+              ...p,
+              displayName: p.displayName || finalDisplayName,
+              avatar: p.avatar || user.avatar,
+            }
+            : p
+        )
         : [
-            ...room.players,
-            {
-              userId: uid,
-              displayName: finalDisplayName,
-              avatar: user.avatar,
-              score: 0,
-              isHost: false,
-              isReady: false,
-              isFinished: false,
-              joinedAt: Date.now(),
-            },
-          ];
+          ...room.players,
+          {
+            userId: uid,
+            displayName: finalDisplayName,
+            avatar: user.avatar,
+            score: 0,
+            isHost: false,
+            isReady: false,
+            isFinished: false,
+            joinedAt: Date.now(),
+          },
+        ];
 
       const kickedUserIds = room.kickedUserIds.filter((id) => id !== uid);
 
@@ -1002,9 +1027,9 @@ io.on("connection", (socket) => {
       const players = room.players.map((p) =>
         p.userId === uid
           ? {
-              ...p,
-              score: Number(p.score || 0) + Number(delta || 0),
-            }
+            ...p,
+            score: Number(p.score || 0) + Number(delta || 0),
+          }
           : p
       );
 
@@ -1089,7 +1114,7 @@ io.on("connection", (socket) => {
       await emitRoomUpdated(roomId);
       await emitLeaderboardIfChanged(beforeTop);
     } catch (error) {
-      await pool.query("ROLLBACK").catch(() => {});
+      await pool.query("ROLLBACK").catch(() => { });
       console.error("finish_game error:", error);
     }
   });
