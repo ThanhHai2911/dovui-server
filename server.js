@@ -965,7 +965,7 @@ app.post("/users/sync", async (req, res) => {
       DO UPDATE SET
         name = EXCLUDED.name,
         email = EXCLUDED.email,
-        avatar = "",
+        avatar = "COALESCE(NULLIF(EXCLUDED.avatar, ''), users.avatar)",
         updated_at = NOW()
       RETURNING *
       `,
