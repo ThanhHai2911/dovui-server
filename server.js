@@ -1008,46 +1008,49 @@ io.on("connection", (socket) => {
   });
 
   socket.on("start_game_with_reset", async ({ roomId }) => {
-  try {
-    const room = await getGameRoom(roomId);
-    if (!room) return;
+    try {
+      const room = await getGameRoom(roomId);
+      if (!room) return;
 
-    // Chỉ kiểm tra người chơi không phải host
-    const nonHostPlayers = room.players.filter((p) => !p.isHost);
+      // Chỉ kiểm tra người chơi không phải host
+      const nonHostPlayers = room.players.filter((p) => !p.isHost);
 
-    // Người chơi phải bấm sẵn sàng
-    // Nếu trước đó đã hoàn thành thì khi bấm sẵn sàng server phải reset isFinished = false
-    const allNonHostReady = nonHostPlayers.every(
-      (p) => p.isReady === true && p.isFinished === false
-    );
+      const allNonHostReady = nonHostPlayers.every(
+        (p) => p.isReady === true
+      );
 
-    if (room.players.length < 2 || !allNonHostReady) {
-      console.log("START BLOCKED:", {
-        roomId,
-        players: room.players.map((p) => ({
-          name: p.displayName,
-          isHost: p.isHost,
-          isReady: p.isReady,
-          isFinished: p.isFinished,
-        })),
-      });
+      if (room.players.length < 2 || !allNonHostReady) {
+        await emitRoomUpdated(roomId);
+        return;
+      }
 
-      await emitRoomUpdated(roomId);
-      return;
-    }
+      if (room.players.length < 2 || !allNonHostReady) {
+        console.log("START BLOCKED:", {
+          roomId,
+          players: room.players.map((p) => ({
+            name: p.displayName,
+            isHost: p.isHost,
+            isReady: p.isReady,
+            isFinished: p.isFinished,
+          })),
+        });
 
-    const startedAt = Date.now();
+        await emitRoomUpdated(roomId);
+        return;
+      }
 
-    const players = room.players.map((p) => ({
-      ...p,
-      score: 0,
-      isFinished: false,
-      // host luôn ready, người chơi giữ ready hiện tại
-      isReady: p.isHost ? true : p.isReady,
-    }));
+      const startedAt = Date.now();
 
-    await pool.query(
-      `
+      const players = room.players.map((p) => ({
+        ...p,
+        score: 0,
+        isFinished: false,
+        // host luôn ready, người chơi giữ ready hiện tại
+        isReady: p.isHost ? true : p.isReady,
+      }));
+
+      await pool.query(
+        `
       UPDATE game_rooms
       SET status = 'playing',
           players = $1::jsonb,
@@ -1055,14 +1058,14 @@ io.on("connection", (socket) => {
           updated_at = NOW()
       WHERE room_id = $3
       `,
-      [JSON.stringify(players), startedAt, roomId]
-    );
+        [JSON.stringify(players), startedAt, roomId]
+      );
 
-    await emitRoomUpdated(roomId);
-  } catch (error) {
-    console.error("start_game_with_reset error:", error);
-  }
-});
+      await emitRoomUpdated(roomId);
+    } catch (error) {
+      console.error("start_game_with_reset error:", error);
+    }
+  });
 
   socket.on("update_room_score", async ({ roomId, uid, delta }) => {
     try {
