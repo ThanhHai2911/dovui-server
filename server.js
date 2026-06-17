@@ -824,9 +824,10 @@ server.listen(PORT, () => {
 });
 
 // =========================
-// SYNC USER FROM FIREBASE TO POSTGRES
+// USER ROUTES - OPTIMIZED ORDER
 // =========================
 
+// 1. SYNC USER
 app.post("/users/sync", async (req, res) => {
   try {
     const { uid, name, email, avatar = "" } = req.body;
@@ -861,133 +862,14 @@ app.post("/users/sync", async (req, res) => {
       [uid, name || "", email || "", playerId, avatar || ""]
     );
 
-    res.json({
-      success: true,
-      user: result.rows[0],
-    });
+    res.json({ success: true, user: result.rows[0] });
   } catch (e) {
-    console.error("sync user error:", e);
-    res.status(500).json({
-      success: false,
-      message: e.message,
-    });
+    console.error("SYNC USER ERROR:", e);
+    res.status(500).json({ success: false, message: e.message });
   }
 });
 
-// =========================
-// CHECK IF USERNAME EXISTS
-// =========================
-
-app.get("/users/check-name", async (req, res) => {
-  try {
-    const name = req.query.name?.trim();
-
-    if (!name) {
-      return res.json({ exists: false });
-    }
-
-    const result = await pool.query(
-      "SELECT uid FROM users WHERE LOWER(name) = LOWER($1) LIMIT 1",
-      [name]
-    );
-
-    res.json({
-      exists: result.rows.length > 0,
-    });
-  } catch (e) {
-    res.status(500).json({
-      exists: false,
-      message: e.message,
-    });
-  }
-});
-
-
-// =========================
-// GET USER BY NAME
-// =========================
-
-app.get("/users/by-name/:name", async (req, res) => {
-  try {
-    const name = req.params.name?.trim();
-
-    if (!name) {
-      return res.status(400).json({
-        user: null,
-        message: "Thiếu tên đăng nhập",
-      });
-    }
-
-    const result = await pool.query(
-      `
-      SELECT *
-      FROM users
-      WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))
-      LIMIT 1
-      `,
-      [name]
-    );
-
-    res.json({
-      user: result.rows[0] || null,
-    });
-  } catch (e) {
-    console.error("get user by name error:", e);
-    res.status(500).json({
-      user: null,
-      message: e.message,
-    });
-  }
-});
-
-// =========================
-// GET USER BY UID
-// =========================
-
-app.get("/users/:uid", async (req, res) => {
-  try {
-    const result = await pool.query(
-      "SELECT * FROM users WHERE uid = $1 LIMIT 1",
-      [req.params.uid]
-    );
-
-    res.json({
-      user: result.rows[0] || null,
-    });
-  } catch (e) {
-    res.status(500).json({
-      user: null,
-      message: e.message,
-    });
-  }
-});
-
-// =========================
-// UPDATE USER SCORE
-// =========================
-
-app.patch("/users/:uid/score", async (req, res) => {
-  try {
-    const { score } = req.body;
-
-    await pool.query(
-      "UPDATE users SET score = $1, updated_at = NOW() WHERE uid = $2",
-      [score, req.params.uid]
-    );
-
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({
-      success: false,
-      message: e.message,
-    });
-  }
-});
-
-// =========================
-// GET LEADERBOARD
-// =========================
-
+// 2. LEADERBOARD - PHẢI TRƯỚC /users/:uid
 app.get("/users/leaderboard", async (req, res) => {
   try {
     const result = await pool.query(`
@@ -1008,63 +890,44 @@ app.get("/users/leaderboard", async (req, res) => {
       LIMIT 10
     `);
 
-    res.json({
-      users: result.rows,
-    });
+    res.json({ users: result.rows });
   } catch (err) {
     console.error("LEADERBOARD ERROR:", err);
-    res.status(500).json({
-      users: [],
-      error: err.message,
-    });
+    res.status(500).json({ users: [], error: err.message });
   }
 });
 
-// =========================
-// GET USER COUNT
-// =========================
-
+// 3. COUNT
 app.get("/users/count", async (req, res) => {
   try {
     const result = await pool.query("SELECT COUNT(*) FROM users");
-
-    res.json({
-      count: Number(result.rows[0].count),
-    });
+    res.json({ count: Number(result.rows[0].count) });
   } catch (e) {
-    res.status(500).json({
-      count: 0,
-      message: e.message,
-    });
+    res.status(500).json({ count: 0, message: e.message });
   }
 });
 
-// =========================
-// DELETE USER (FOR TESTING)
-// =========================
-
-app.delete("/users/:uid", async (req, res) => {
+// 4. CHECK NAME
+app.get("/users/check-name", async (req, res) => {
   try {
-    await pool.query("DELETE FROM users WHERE uid = $1", [req.params.uid]);
+    const name = req.query.name?.trim();
+    if (!name) return res.json({ exists: false });
 
-    res.json({
-      success: true,
-    });
+    const result = await pool.query(
+      "SELECT uid FROM users WHERE LOWER(name) = LOWER($1) LIMIT 1",
+      [name]
+    );
+
+    res.json({ exists: result.rows.length > 0 });
   } catch (e) {
-    res.status(500).json({
-      success: false,
-      message: e.message,
-    });
+    res.status(500).json({ exists: false, message: e.message });
   }
 });
 
-// =========================
-// CHECK IF PLAYER ID EXISTS
-// =========================
-
+// 5. CHECK PLAYER ID
 app.get("/users/check-player-id", async (req, res) => {
   try {
-    const { playerId } = req.query;
+    const playerId = req.query.playerId?.trim();
 
     if (!playerId) {
       return res.status(400).json({ error: "MISSING_PLAYER_ID" });
@@ -1079,25 +942,46 @@ app.get("/users/check-player-id", async (req, res) => {
       return res.json({ exists: false, uid: null });
     }
 
-    return res.json({
+    res.json({
       exists: true,
       uid: result.rows[0].uid,
     });
   } catch (err) {
-    console.error("CHECK PLAYER ID ERROR:", err);
-    return res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// =========================
-// UPDATE USER PROFILE
-// =========================
+// 6. GET USER BY NAME
+app.get("/users/by-name/:name", async (req, res) => {
+  try {
+    const name = req.params.name?.trim();
 
+    if (!name) {
+      return res.status(400).json({ user: null, message: "Thiếu tên" });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM users
+      WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))
+      LIMIT 1
+      `,
+      [name]
+    );
+
+    res.json({ user: result.rows[0] || null });
+  } catch (e) {
+    res.status(500).json({ user: null, message: e.message });
+  }
+});
+
+// 7. UPDATE PROFILE
 app.patch("/users/:uid/profile", async (req, res) => {
   try {
     const { uid } = req.params;
-    const name = req.body.name;
-    const playerId = req.body.playerId || req.body.player_id;
+    const name = req.body.name?.trim();
+    const playerId = (req.body.playerId || req.body.player_id)?.trim();
     const avatar = req.body.avatar ?? null;
 
     if (!name || !playerId) {
@@ -1106,9 +990,9 @@ app.patch("/users/:uid/profile", async (req, res) => {
 
     const existing = await pool.query(
       `
-      SELECT uid 
-      FROM users 
-      WHERE LOWER(player_id) = LOWER($1) 
+      SELECT uid
+      FROM users
+      WHERE LOWER(player_id) = LOWER($1)
       AND uid <> $2
       LIMIT 1
       `,
@@ -1122,7 +1006,7 @@ app.patch("/users/:uid/profile", async (req, res) => {
     const result = await pool.query(
       `
       UPDATE users
-      SET 
+      SET
         name = $1,
         player_id = $2,
         avatar = COALESCE(NULLIF($3, ''), avatar),
@@ -1137,41 +1021,56 @@ app.patch("/users/:uid/profile", async (req, res) => {
       return res.status(404).json({ error: "USER_NOT_FOUND" });
     }
 
-    return res.json({ user: result.rows[0] });
+    res.json({ user: result.rows[0] });
   } catch (err) {
     console.error("UPDATE PROFILE ERROR:", err);
-    return res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
+// 8. UPDATE SCORE
+app.patch("/users/:uid/score", async (req, res) => {
+  try {
+    const { score } = req.body;
 
+    await pool.query(
+      "UPDATE users SET score = $1, updated_at = NOW() WHERE uid = $2",
+      [score, req.params.uid]
+    );
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// 9. UPDATE VIP
 app.patch("/users/:uid/vip", async (req, res) => {
-  const { uid } = req.params;
+  try {
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET is_vip = true,
+          updated_at = NOW()
+      WHERE uid = $1
+      RETURNING *
+      `,
+      [req.params.uid]
+    );
 
-  const result = await pool.query(
-    `
-    UPDATE users
-    SET is_vip = true,
-        updated_at = NOW()
-    WHERE uid = $1
-    RETURNING *
-    `,
-    [uid]
-  );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "USER_NOT_FOUND" });
+    }
 
-  if (result.rows.length === 0) {
-    return res.status(404).json({ error: "USER_NOT_FOUND" });
+    res.json({ user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-
-  res.json({ user: result.rows[0] });
 });
 
-//
-
+// 10. CHECK IN
 app.post("/users/:uid/check-in", async (req, res) => {
   try {
-    const { uid } = req.params;
-
     const result = await pool.query(
       `
       UPDATE users
@@ -1183,7 +1082,7 @@ app.post("/users/:uid/check-in", async (req, res) => {
         AND (last_check_in IS NULL OR last_check_in < CURRENT_DATE)
       RETURNING *
       `,
-      [uid]
+      [req.params.uid]
     );
 
     if (result.rows.length === 0) {
@@ -1196,11 +1095,9 @@ app.post("/users/:uid/check-in", async (req, res) => {
   }
 });
 
-
+// 11. WATCH VIDEO REWARD
 app.post("/users/:uid/watch-video-reward", async (req, res) => {
   try {
-    const { uid } = req.params;
-
     const result = await pool.query(
       `
       UPDATE users
@@ -1212,7 +1109,7 @@ app.post("/users/:uid/watch-video-reward", async (req, res) => {
         AND (last_video_watch IS NULL OR last_video_watch < CURRENT_DATE)
       RETURNING *
       `,
-      [uid]
+      [req.params.uid]
     );
 
     if (result.rows.length === 0) {
@@ -1225,30 +1122,59 @@ app.post("/users/:uid/watch-video-reward", async (req, res) => {
   }
 });
 
+// 12. HOME USER
 app.get("/users/:uid/home", async (req, res) => {
-  const { uid } = req.params;
+  try {
+    const result = await pool.query(
+      `
+      SELECT name, score, created_at
+      FROM users
+      WHERE uid = $1
+      LIMIT 1
+      `,
+      [req.params.uid]
+    );
 
-  const result = await pool.query(
-    `SELECT name, score, created_at
-     FROM users
-     WHERE uid = $1`,
-    [uid]
-  );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "USER_NOT_FOUND" });
+    }
 
-  if (result.rows.length === 0) {
-    return res.status(404).json({ message: "USER_NOT_FOUND" });
+    const user = result.rows[0];
+
+    const days = Math.floor(
+      (new Date() - new Date(user.created_at)) / (1000 * 60 * 60 * 24)
+    );
+
+    res.json({
+      name: user.name,
+      score: user.score,
+      days,
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
   }
-
-  const user = result.rows[0];
-
-  const days = Math.floor(
-    (new Date() - new Date(user.created_at)) / (1000 * 60 * 60 * 24)
-  );
-
-  res.json({
-    name: user.name,
-    score: user.score,
-    days: days,
-  });
 });
 
+// 13. GET USER BY UID - ĐỂ GẦN CUỐI
+app.get("/users/:uid", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM users WHERE uid = $1 LIMIT 1",
+      [req.params.uid]
+    );
+
+    res.json({ user: result.rows[0] || null });
+  } catch (e) {
+    res.status(500).json({ user: null, message: e.message });
+  }
+});
+
+// 14. DELETE USER - CUỐI
+app.delete("/users/:uid", async (req, res) => {
+  try {
+    await pool.query("DELETE FROM users WHERE uid = $1", [req.params.uid]);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
