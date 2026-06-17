@@ -1203,7 +1203,29 @@ app.get("/users/:uid/home", async (req, res) => {
 app.get("/users/:uid", async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT * FROM users WHERE uid = $1 LIMIT 1",
+      `
+      SELECT *
+      FROM (
+        SELECT
+          uid,
+          name,
+          email,
+          player_id,
+          avatar,
+          score,
+          stars,
+          is_vip,
+          is_admin,
+          is_online,
+          last_seen,
+          created_at,
+          updated_at,
+          RANK() OVER (ORDER BY score DESC) AS rank
+        FROM users
+      ) ranked_users
+      WHERE uid = $1
+      LIMIT 1
+      `,
       [req.params.uid]
     );
 
