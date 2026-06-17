@@ -399,10 +399,10 @@ io.on("connection", (socket) => {
   // Client join socket room để nhận room_updated realtime.
   socket.on("join_socket_room", ({ roomId }) => {
     if (!roomId) return;
-    socket.join(roomId);
+    socket.join(roomId.trim().toUpperCase());
   });
 
-  // Tạo phòng và lưu vào Neon.
+  // Tạo phòng và lưu vào Neon
   socket.on("create_game_room", async (data, callback) => {
     try {
       const {
@@ -423,16 +423,18 @@ io.on("connection", (socket) => {
         });
       }
 
-      const now = Date.now();
-
-      const userInfo = await getUserByUid(uid);
+      // Lấy tên + avatar trực tiếp từ Neon theo uid
+      const user = await getUserLite(uid);
 
       const finalDisplayName =
-        userInfo.name && userInfo.name !== "Ẩn danh"
-          ? userInfo.name
-          : displayName || "Người chơi";
+        user.name && user.name !== "Ẩn danh"
+          ? user.name
+          : displayName && displayName !== "Ẩn danh"
+            ? displayName
+            : "Người chơi";
 
-      const finalAvatar = userInfo.avatar || "";
+      const finalAvatar = user.avatar || "";
+      const now = Date.now();
 
       const { roomId, roomData } = await createRoomWithRetry((newRoomId) => ({
         roomId: newRoomId,
@@ -455,7 +457,7 @@ io.on("connection", (socket) => {
           {
             userId: uid,
             displayName: finalDisplayName,
-            avatar: user.avatar,
+            avatar: finalAvatar,
             score: 0,
             isHost: true,
             isReady: true,
@@ -484,7 +486,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Vào phòng bằng mã hoặc lời mời.
+  // Vào phòng bằng mã hoặc lời mời
   socket.on("join_game_room", async (data, callback) => {
     try {
       const {
@@ -543,18 +545,29 @@ io.on("connection", (socket) => {
         });
       }
 
-      const alreadyInRoom = room.players.some((p) => p.userId === uid);
-
       const user = await getUserLite(uid);
-      const finalDisplayName = displayName || user.name;
+
+      const finalDisplayName =
+        user.name && user.name !== "Ẩn danh"
+          ? user.name
+          : displayName && displayName !== "Ẩn danh"
+            ? displayName
+            : "Người chơi";
+
+      const finalAvatar = user.avatar || "";
+
+      const alreadyInRoom = room.players.some((p) => p.userId === uid);
 
       const newPlayers = alreadyInRoom
         ? room.players.map((p) =>
           p.userId === uid
             ? {
               ...p,
-              displayName: p.displayName || finalDisplayName,
-              avatar: p.avatar || user.avatar,
+              displayName:
+                p.displayName && p.displayName !== "Ẩn danh"
+                  ? p.displayName
+                  : finalDisplayName,
+              avatar: p.avatar || finalAvatar,
             }
             : p
         )
@@ -563,7 +576,7 @@ io.on("connection", (socket) => {
           {
             userId: uid,
             displayName: finalDisplayName,
-            avatar: user.avatar,
+            avatar: finalAvatar,
             score: 0,
             isHost: false,
             isReady: false,
@@ -576,12 +589,12 @@ io.on("connection", (socket) => {
 
       await pool.query(
         `
-        UPDATE game_rooms
-        SET players = $1::jsonb,
-            kicked_user_ids = $2::jsonb,
-            updated_at = NOW()
-        WHERE room_id = $3
-        `,
+      UPDATE game_rooms
+      SET players = $1::jsonb,
+          kicked_user_ids = $2::jsonb,
+          updated_at = NOW()
+      WHERE room_id = $3
+      `,
         [JSON.stringify(newPlayers), JSON.stringify(kickedUserIds), cleanRoomId]
       );
 
