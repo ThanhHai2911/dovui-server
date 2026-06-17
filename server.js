@@ -848,6 +848,11 @@ io.on("connection", (socket) => {
   });
 });
 
+socket.on("join_socket_room", ({ roomId }) => {
+  if (!roomId) return;
+  socket.join(roomId);
+});
+
 // =========================
 // USER ROUTES
 // =========================
