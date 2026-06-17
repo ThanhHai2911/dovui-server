@@ -1097,44 +1097,23 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("mark_player_finished", async ({ roomId, uid }) => {
-    try {
-      const room = await getGameRoom(roomId);
-      if (!room) return;
+  // SAU — ĐÚNG
+socket.on("mark_player_finished", async ({ roomId, uid }) => {
+  const room = await getGameRoom(roomId);
+  if (!room) return;
 
-      const currentPlayer = room.players.find((p) => p.userId === uid);
-      if (!currentPlayer) return;
+  const players = room.players.map((p) =>
+    p.userId === uid ? { ...p, isFinished: true } : p
+  );
 
-      const isHostFinished = currentPlayer.isHost === true;
+  await pool.query(`
+    UPDATE game_rooms
+    SET players = $1::jsonb, updated_at = NOW()
+    WHERE room_id = $2
+  `, [JSON.stringify(players), roomId]);
 
-      const players = room.players.map((p) =>
-        p.userId === uid
-          ? {
-            ...p,
-            isFinished: true,
-          }
-          : p
-      );
-
-      // Nếu host hoàn thành thì chuyển phòng về waiting ngay
-      const nextStatus = isHostFinished ? "waiting" : room.status;
-
-      await pool.query(
-        `
-      UPDATE game_rooms
-      SET players = $1::jsonb,
-          status = $2,
-          updated_at = NOW()
-      WHERE room_id = $3
-      `,
-        [JSON.stringify(players), nextStatus, roomId]
-      );
-
-      await emitRoomUpdated(roomId);
-    } catch (error) {
-      console.error("mark_player_finished error:", error);
-    }
-  });
+  await emitRoomUpdated(roomId);
+});
 
   socket.on("finish_game", async ({ roomId }) => {
     try {
