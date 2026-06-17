@@ -796,6 +796,56 @@ io.on("connection", (socket) => {
     }
   });
 
+  // =========================
+  // GAME ROOM - NEON OPTIMIZED
+  // =========================
+
+  // Client vào socket room để nhận room_updated nhanh
+  socket.on("join_socket_room", ({ roomId }) => {
+    if (!roomId) return;
+    socket.join(roomId);
+  });
+
+  // Load tin nhắn phòng từ Neon khi mở chat
+  socket.on("join-room-chat", async ({ roomId }) => {
+    try {
+      if (!roomId) return;
+
+      socket.join(`room_chat_${roomId}`);
+
+      const result = await pool.query(
+        `
+      SELECT id, room_id, user_id, display_name, text, sent_at
+      FROM room_messages
+      WHERE room_id = $1
+      ORDER BY sent_at ASC
+      LIMIT 100
+      `,
+        [roomId]
+      );
+
+      const messages = result.rows.map((row) => ({
+        id: row.id.toString(),
+        roomId: row.room_id,
+        userId: row.user_id,
+        displayName: row.display_name || "Ẩn danh",
+        text: row.text || "",
+        sentAt: new Date(row.sent_at).toISOString(),
+      }));
+
+      socket.emit("room-messages", messages);
+    } catch (error) {
+      console.error("join-room-chat error:", error);
+    }
+  });
+
+  // Rời chat room
+  socket.on("leave-room-chat", ({ roomId }) => {
+    if (!roomId) return;
+    socket.leave(`room_chat_${roomId}`);
+  });
+
+  // Gửi tin nhắn phòng + lưu Neon
   socket.on("send-room-message", async (data) => {
     try {
       const { roomId, userId, displayName, text } = data;
@@ -814,18 +864,264 @@ io.on("connection", (socket) => {
 
       const row = result.rows[0];
 
-      const messageForSocket = {
+      const message = {
         id: row.id.toString(),
         roomId: row.room_id,
         userId: row.user_id,
         displayName: row.display_name || "Ẩn danh",
-        text: row.text,
+        text: row.text || "",
         sentAt: new Date(row.sent_at).toISOString(),
       };
 
-      io.to(`room_chat_${roomId}`).emit("room-message", messageForSocket);
+      io.to(`room_chat_${roomId}`).emit("room-message", message);
     } catch (error) {
       console.error("send-room-message error:", error);
+    }
+  });
+
+  // Sẵn sàng / hủy sẵn sàng
+  socket.on("set_player_ready", async ({ roomId, uid, isReady }) => {
+    try {
+      const room = await getGameRoom(roomId);
+      if (!room) return;
+
+      const players = room.players.map((p) =>
+        p.userId === uid ? { ...p, isReady } : p
+      );
+
+      await pool.query(
+        `
+      UPDATE game_rooms
+      SET players = $1::jsonb,
+          updated_at = NOW()
+      WHERE room_id = $2
+      `,
+        [JSON.stringify(players), roomId]
+      );
+
+      io.to(roomId).emit("room_updated", {
+        ...room,
+        players,
+        updatedAt: Date.now(),
+      });
+    } catch (error) {
+      console.error("set_player_ready error:", error);
+    }
+  });
+
+  // Chủ phòng bắt đầu game
+  socket.on("start_game_with_reset", async ({ roomId }) => {
+    try {
+      const room = await getGameRoom(roomId);
+      if (!room) return;
+
+      const startedAt = Date.now();
+
+      const players = room.players.map((p) => ({
+        ...p,
+        score: 0,
+        isFinished: false,
+      }));
+
+      await pool.query(
+        `
+      UPDATE game_rooms
+      SET status = 'playing',
+          players = $1::jsonb,
+          started_at = $2,
+          updated_at = NOW()
+      WHERE room_id = $3
+      `,
+        [JSON.stringify(players), startedAt, roomId]
+      );
+
+      io.to(roomId).emit("room_updated", {
+        ...room,
+        status: "playing",
+        players,
+        startedAt,
+        updatedAt: startedAt,
+      });
+    } catch (error) {
+      console.error("start_game_with_reset error:", error);
+    }
+  });
+
+  // Cập nhật điểm trong phòng
+  socket.on("update_room_score", async ({ roomId, uid, delta }) => {
+    try {
+      const room = await getGameRoom(roomId);
+      if (!room) return;
+
+      const players = room.players.map((p) =>
+        p.userId === uid
+          ? { ...p, score: Number(p.score || 0) + Number(delta || 0) }
+          : p
+      );
+
+      await pool.query(
+        `
+      UPDATE game_rooms
+      SET players = $1::jsonb,
+          updated_at = NOW()
+      WHERE room_id = $2
+      `,
+        [JSON.stringify(players), roomId]
+      );
+
+      io.to(roomId).emit("room_updated", {
+        ...room,
+        players,
+        updatedAt: Date.now(),
+      });
+    } catch (error) {
+      console.error("update_room_score error:", error);
+    }
+  });
+
+  // Người chơi hoàn thành
+  socket.on("mark_player_finished", async ({ roomId, uid }) => {
+    try {
+      const room = await getGameRoom(roomId);
+      if (!room) return;
+
+      const players = room.players.map((p) =>
+        p.userId === uid ? { ...p, isFinished: true } : p
+      );
+
+      await pool.query(
+        `
+      UPDATE game_rooms
+      SET players = $1::jsonb,
+          updated_at = NOW()
+      WHERE room_id = $2
+      `,
+        [JSON.stringify(players), roomId]
+      );
+
+      io.to(roomId).emit("room_updated", {
+        ...room,
+        players,
+        updatedAt: Date.now(),
+      });
+    } catch (error) {
+      console.error("mark_player_finished error:", error);
+    }
+  });
+
+  // Kết thúc game, cộng điểm vào users Neon
+  socket.on("finish_game", async ({ roomId }) => {
+    try {
+      const room = await getGameRoom(roomId);
+      if (!room) return;
+
+      await pool.query("BEGIN");
+
+      await pool.query(
+        `
+      UPDATE game_rooms
+      SET status = 'waiting',
+          updated_at = NOW()
+      WHERE room_id = $1
+      `,
+        [roomId]
+      );
+
+      for (const p of room.players) {
+        const score = Number(p.score || 0);
+
+        if (score > 0) {
+          await pool.query(
+            `
+          UPDATE users
+          SET score = score + $1,
+              updated_at = NOW()
+          WHERE uid = $2
+          `,
+            [score, p.userId]
+          );
+        }
+      }
+
+      await pool.query("COMMIT");
+
+      io.to(roomId).emit("room_updated", {
+        ...room,
+        status: "waiting",
+        updatedAt: Date.now(),
+      });
+
+      io.emit("leaderboard_updated", await getTopLeaderboard());
+    } catch (error) {
+      await pool.query("ROLLBACK").catch(() => { });
+      console.error("finish_game error:", error);
+    }
+  });
+
+  // Reset phòng về waiting
+  socket.on("reset_room", async ({ roomId }) => {
+    try {
+      const room = await getGameRoom(roomId);
+      if (!room) return;
+
+      const players = room.players.map((p) => ({
+        ...p,
+        isFinished: false,
+      }));
+
+      await pool.query(
+        `
+      UPDATE game_rooms
+      SET status = 'waiting',
+          players = $1::jsonb,
+          started_at = NULL,
+          current_level_id = NULL,
+          updated_at = NOW()
+      WHERE room_id = $2
+      `,
+        [JSON.stringify(players), roomId]
+      );
+
+      io.to(roomId).emit("room_updated", {
+        ...room,
+        status: "waiting",
+        players,
+        startedAt: null,
+        currentLevelId: null,
+        updatedAt: Date.now(),
+      });
+    } catch (error) {
+      console.error("reset_room error:", error);
+    }
+  });
+
+  // Sau game, reset ready non-host
+  socket.on("reset_all_players_ready", async ({ roomId }) => {
+    try {
+      const room = await getGameRoom(roomId);
+      if (!room) return;
+
+      const players = room.players.map((p) =>
+        p.isHost ? p : { ...p, isReady: false }
+      );
+
+      await pool.query(
+        `
+      UPDATE game_rooms
+      SET players = $1::jsonb,
+          updated_at = NOW()
+      WHERE room_id = $2
+      `,
+        [JSON.stringify(players), roomId]
+      );
+
+      io.to(roomId).emit("room_updated", {
+        ...room,
+        players,
+        updatedAt: Date.now(),
+      });
+    } catch (error) {
+      console.error("reset_all_players_ready error:", error);
     }
   });
 
