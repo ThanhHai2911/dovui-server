@@ -1046,22 +1046,22 @@ io.on("connection", (socket) => {
   // =========================
 
   // SAU — emit thẳng, bỏ round-trip thứ 2
-socket.on("set_player_ready", async ({ roomId, uid, isReady }) => {
-  const room = await getGameRoom(roomId);
-  if (!room) return;
+  socket.on("set_player_ready", async ({ roomId, uid, isReady }) => {
+    const room = await getGameRoom(roomId);
+    if (!room) return;
 
-  const players = await enrichPlayersWithAvatar(
-    room.players.map((p) =>
-      p.userId === uid ? { ...p, isReady, isFinished: isReady ? false : p.isFinished } : p
-    )
-  );
+    const players = await enrichPlayersWithAvatar(
+      room.players.map((p) =>
+        p.userId === uid ? { ...p, isReady, isFinished: isReady ? false : p.isFinished } : p
+      )
+    );
 
-  await pool.query(`UPDATE game_rooms SET players=$1::jsonb, updated_at=NOW() WHERE room_id=$2`,
-    [JSON.stringify(players), roomId]);
+    await pool.query(`UPDATE game_rooms SET players=$1::jsonb, updated_at=NOW() WHERE room_id=$2`,
+      [JSON.stringify(players), roomId]);
 
-  // Emit thẳng từ data đã có, không query lại
-  io.to(roomId).emit("room_updated", { ...room, players, updatedAt: Date.now() });
-});
+    // Emit thẳng từ data đã có, không query lại
+    io.to(roomId).emit("room_updated", { ...room, players, updatedAt: Date.now() });
+  });
 
   socket.on("start_game_with_reset", async ({ roomId }) => {
     try {
@@ -1154,22 +1154,22 @@ socket.on("set_player_ready", async ({ roomId, uid, isReady }) => {
   });
 
   // SAU — ĐÚNG
-socket.on("mark_player_finished", async ({ roomId, uid }) => {
-  const room = await getGameRoom(roomId);
-  if (!room) return;
+  socket.on("mark_player_finished", async ({ roomId, uid }) => {
+    const room = await getGameRoom(roomId);
+    if (!room) return;
 
-  const players = room.players.map((p) =>
-    p.userId === uid ? { ...p, isFinished: true } : p
-  );
+    const players = room.players.map((p) =>
+      p.userId === uid ? { ...p, isFinished: true } : p
+    );
 
-  await pool.query(`
+    await pool.query(`
     UPDATE game_rooms
     SET players = $1::jsonb, updated_at = NOW()
     WHERE room_id = $2
   `, [JSON.stringify(players), roomId]);
 
-  await emitRoomUpdated(roomId);
-});
+    await emitRoomUpdated(roomId);
+  });
 
   socket.on("finish_game", async ({ roomId }) => {
     try {
@@ -2251,6 +2251,633 @@ app.delete("/quiz-progress/clear", async (req, res) => {
     });
   }
 });
+
+// =========================
+// FRIEND ROUTES - NEON
+// =========================
+// Toàn bộ phần bạn bè/lời mời kết bạn dùng Neon.
+// Không còn lưu friends/friend_requests trên Firebase nữa.
+
+// Load nhanh toàn bộ dữ liệu màn bạn bè trong 1 request:
+// - friends
+// - requests nhận được
+// - sentRequests đã gửi
+// - suggestions gợi ý kết bạn
+app.get("/friends/bootstrap/:uid", async (req, res) => {
+  try {
+    const { uid } = req.params;
+
+    if (!uid) {
+      return res.status(400).json({
+        friends: [],
+        requests: [],
+        sentRequests: [],
+        suggestions: [],
+      });
+    }
+
+    const [friends, requests, sentRequests, suggestions] = await Promise.all([
+      pool.query(
+        `
+        SELECT
+          u.uid,
+          u.name,
+          u.player_id AS "playerId",
+          u.avatar,
+          u.score
+        FROM friends f
+        JOIN users u ON u.uid = f.friend_id
+        WHERE f.user_id = $1
+        ORDER BY LOWER(u.name) ASC
+        `,
+        [uid]
+      ),
+
+      pool.query(
+        `
+        SELECT
+          fr.id AS "requestId",
+          fr.from_uid AS "fromUid",
+          fr.to_uid AS "toUid",
+          fr.status,
+          fr.created_at AS "createdAt",
+          u.name AS "fromName",
+          u.player_id AS "fromPlayerId",
+          u.avatar AS "fromAvatar",
+          u.score AS "fromScore"
+        FROM friend_requests fr
+        JOIN users u ON u.uid = fr.from_uid
+        WHERE fr.to_uid = $1
+        AND fr.status = 'pending'
+        ORDER BY fr.created_at DESC
+        `,
+        [uid]
+      ),
+
+      pool.query(
+        `
+        SELECT
+          fr.id AS "requestId",
+          fr.from_uid AS "fromUid",
+          fr.to_uid AS "toUid",
+          fr.status,
+          fr.created_at AS "createdAt",
+          u.name AS "toName",
+          u.player_id AS "toPlayerId",
+          u.avatar AS "toAvatar",
+          u.score AS "toScore"
+        FROM friend_requests fr
+        JOIN users u ON u.uid = fr.to_uid
+        WHERE fr.from_uid = $1
+        AND fr.status = 'pending'
+        ORDER BY fr.created_at DESC
+        `,
+        [uid]
+      ),
+
+      pool.query(
+        `
+        SELECT
+          u.uid,
+          u.name,
+          u.player_id AS "playerId",
+          u.avatar,
+          u.score
+        FROM users u
+        WHERE u.uid <> $1
+        AND u.uid NOT IN (
+          SELECT friend_id FROM friends WHERE user_id = $1
+        )
+        AND u.uid NOT IN (
+          SELECT to_uid FROM friend_requests
+          WHERE from_uid = $1 AND status = 'pending'
+        )
+        AND u.uid NOT IN (
+          SELECT from_uid FROM friend_requests
+          WHERE to_uid = $1 AND status = 'pending'
+        )
+        ORDER BY RANDOM()
+        LIMIT 5
+        `,
+        [uid]
+      ),
+    ]);
+
+    setNoStore(res);
+
+    res.json({
+      friends: friends.rows,
+      requests: requests.rows,
+      sentRequests: sentRequests.rows,
+      suggestions: suggestions.rows,
+    });
+  } catch (e) {
+    console.error("FRIENDS BOOTSTRAP ERROR:", e);
+    res.status(500).json({
+      friends: [],
+      requests: [],
+      sentRequests: [],
+      suggestions: [],
+      error: e.message,
+    });
+  }
+});
+
+// Tìm user theo playerId
+app.get("/friends/search", async (req, res) => {
+  try {
+    const playerId = req.query.playerId?.trim();
+    const currentUid = req.query.currentUid?.trim();
+
+    if (!playerId || !currentUid) {
+      return res.json({ user: null });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        uid,
+        name,
+        player_id AS "playerId",
+        avatar,
+        score
+      FROM users
+      WHERE LOWER(player_id) = LOWER($1)
+      AND uid <> $2
+      LIMIT 1
+      `,
+      [playerId, currentUid]
+    );
+
+    setNoStore(res);
+
+    res.json({
+      user: result.rows[0] || null,
+    });
+  } catch (e) {
+    console.error("FRIEND SEARCH ERROR:", e);
+    res.status(500).json({
+      user: null,
+      error: e.message,
+    });
+  }
+});
+
+// Gửi lời mời kết bạn
+app.post("/friends/request", async (req, res) => {
+  try {
+    const { fromUid, toUid } = req.body;
+
+    if (!fromUid || !toUid || fromUid === toUid) {
+      return res.status(400).json({
+        success: false,
+        message: "INVALID_DATA",
+      });
+    }
+
+    const isFriend = await pool.query(
+      `
+      SELECT 1
+      FROM friends
+      WHERE user_id = $1
+      AND friend_id = $2
+      LIMIT 1
+      `,
+      [fromUid, toUid]
+    );
+
+    if (isFriend.rows.length > 0) {
+      return res.json({
+        success: true,
+        message: "ALREADY_FRIEND",
+      });
+    }
+
+    const requestId = `${fromUid}_${toUid}`;
+    const reverseRequestId = `${toUid}_${fromUid}`;
+
+    const reverse = await pool.query(
+      `
+      SELECT status
+      FROM friend_requests
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [reverseRequestId]
+    );
+
+    if (reverse.rows[0]?.status === "pending") {
+      return res.json({
+        success: true,
+        message: "REVERSE_PENDING",
+      });
+    }
+
+    await pool.query(
+      `
+      INSERT INTO friend_requests
+      (
+        id,
+        from_uid,
+        to_uid,
+        status,
+        created_at
+      )
+      VALUES ($1, $2, $3, 'pending', NOW())
+      ON CONFLICT (id)
+      DO UPDATE SET
+        status = 'pending',
+        created_at = NOW(),
+        accepted_at = NULL,
+        declined_at = NULL,
+        removed_at = NULL
+      `,
+      [requestId, fromUid, toUid]
+    );
+
+    notifyFriendChanged(fromUid);
+    notifyFriendChanged(toUid);
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error("SEND FRIEND REQUEST ERROR:", e);
+    res.status(500).json({
+      success: false,
+      error: e.message,
+    });
+  }
+});
+
+// Danh sách bạn bè
+app.get("/friends/list/:uid", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        u.uid,
+        u.name,
+        u.player_id AS "playerId",
+        u.avatar,
+        u.score
+      FROM friends f
+      JOIN users u ON u.uid = f.friend_id
+      WHERE f.user_id = $1
+      ORDER BY LOWER(u.name) ASC
+      `,
+      [req.params.uid]
+    );
+
+    setShortCache(res, 3);
+
+    res.json({
+      friends: result.rows,
+    });
+  } catch (e) {
+    console.error("GET FRIENDS ERROR:", e);
+    res.status(500).json({
+      friends: [],
+      error: e.message,
+    });
+  }
+});
+
+// Lời mời nhận được
+app.get("/friends/requests/:uid", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        fr.id AS "requestId",
+        fr.from_uid AS "fromUid",
+        fr.to_uid AS "toUid",
+        fr.status,
+        fr.created_at AS "createdAt",
+        u.name AS "fromName",
+        u.player_id AS "fromPlayerId",
+        u.avatar AS "fromAvatar",
+        u.score AS "fromScore"
+      FROM friend_requests fr
+      JOIN users u ON u.uid = fr.from_uid
+      WHERE fr.to_uid = $1
+      AND fr.status = 'pending'
+      ORDER BY fr.created_at DESC
+      `,
+      [req.params.uid]
+    );
+
+    setNoStore(res);
+
+    res.json({
+      requests: result.rows,
+    });
+  } catch (e) {
+    console.error("GET REQUESTS ERROR:", e);
+    res.status(500).json({
+      requests: [],
+      error: e.message,
+    });
+  }
+});
+
+// Lời mời đã gửi
+app.get("/friends/sent/:uid", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        fr.id AS "requestId",
+        fr.from_uid AS "fromUid",
+        fr.to_uid AS "toUid",
+        fr.status,
+        fr.created_at AS "createdAt",
+        u.name AS "toName",
+        u.player_id AS "toPlayerId",
+        u.avatar AS "toAvatar",
+        u.score AS "toScore"
+      FROM friend_requests fr
+      JOIN users u ON u.uid = fr.to_uid
+      WHERE fr.from_uid = $1
+      AND fr.status = 'pending'
+      ORDER BY fr.created_at DESC
+      `,
+      [req.params.uid]
+    );
+
+    setNoStore(res);
+
+    res.json({
+      sentRequests: result.rows,
+    });
+  } catch (e) {
+    console.error("GET SENT REQUESTS ERROR:", e);
+    res.status(500).json({
+      sentRequests: [],
+      error: e.message,
+    });
+  }
+});
+
+// Chấp nhận kết bạn
+app.post("/friends/accept", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { requestId, currentUid } = req.body;
+
+    if (!requestId || !currentUid) {
+      return res.status(400).json({
+        success: false,
+        message: "INVALID_DATA",
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const request = await client.query(
+      `
+      SELECT *
+      FROM friend_requests
+      WHERE id = $1
+      AND status = 'pending'
+      LIMIT 1
+      `,
+      [requestId]
+    );
+
+    if (request.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.json({
+        success: false,
+        message: "REQUEST_NOT_FOUND",
+      });
+    }
+
+    const data = request.rows[0];
+
+    if (data.to_uid !== currentUid) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({
+        success: false,
+        message: "NO_PERMISSION",
+      });
+    }
+
+    await client.query(
+      `
+      UPDATE friend_requests
+      SET status = 'accepted',
+          accepted_at = NOW()
+      WHERE id = $1
+      `,
+      [requestId]
+    );
+
+    await client.query(
+      `
+      INSERT INTO friends (user_id, friend_id, created_at)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT DO NOTHING
+      `,
+      [data.to_uid, data.from_uid]
+    );
+
+    await client.query(
+      `
+      INSERT INTO friends (user_id, friend_id, created_at)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT DO NOTHING
+      `,
+      [data.from_uid, data.to_uid]
+    );
+
+    await client.query("COMMIT");
+
+    notifyFriendChanged(data.from_uid);
+    notifyFriendChanged(data.to_uid);
+
+    res.json({ success: true });
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => { });
+    console.error("ACCEPT FRIEND ERROR:", e);
+    res.status(500).json({
+      success: false,
+      error: e.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// Từ chối lời mời
+app.post("/friends/decline", async (req, res) => {
+  try {
+    const { requestId } = req.body;
+
+    if (!requestId) {
+      return res.status(400).json({
+        success: false,
+        message: "INVALID_DATA",
+      });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE friend_requests
+      SET status = 'declined',
+          declined_at = NOW()
+      WHERE id = $1
+      RETURNING from_uid, to_uid
+      `,
+      [requestId]
+    );
+
+    const row = result.rows[0];
+    if (row) {
+      notifyFriendChanged(row.from_uid);
+      notifyFriendChanged(row.to_uid);
+    }
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error("DECLINE FRIEND ERROR:", e);
+    res.status(500).json({
+      success: false,
+      error: e.message,
+    });
+  }
+});
+
+// Xóa bạn bè
+app.post("/friends/remove", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { uid, friendUid } = req.body;
+
+    if (!uid || !friendUid) {
+      return res.status(400).json({
+        success: false,
+        message: "INVALID_DATA",
+      });
+    }
+
+    await client.query("BEGIN");
+
+    await client.query(
+      `
+      DELETE FROM friends
+      WHERE user_id = $1
+      AND friend_id = $2
+      `,
+      [uid, friendUid]
+    );
+
+    await client.query(
+      `
+      DELETE FROM friends
+      WHERE user_id = $1
+      AND friend_id = $2
+      `,
+      [friendUid, uid]
+    );
+
+    await client.query(
+      `
+      INSERT INTO friend_requests
+      (
+        id,
+        from_uid,
+        to_uid,
+        status,
+        removed_at
+      )
+      VALUES ($1, $2, $3, 'removed', NOW())
+      ON CONFLICT (id)
+      DO UPDATE SET
+        status = 'removed',
+        removed_at = NOW()
+      `,
+      [`${uid}_${friendUid}`, uid, friendUid]
+    );
+
+    await client.query("COMMIT");
+
+    notifyFriendChanged(uid);
+    notifyFriendChanged(friendUid);
+
+    res.json({ success: true });
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => { });
+    console.error("REMOVE FRIEND ERROR:", e);
+    res.status(500).json({
+      success: false,
+      error: e.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// Gợi ý bạn bè
+app.get("/friends/suggestions/:uid", async (req, res) => {
+  try {
+    const uid = req.params.uid;
+
+    const result = await pool.query(
+      `
+      SELECT
+        u.uid,
+        u.name,
+        u.player_id AS "playerId",
+        u.avatar,
+        u.score
+      FROM users u
+      WHERE u.uid <> $1
+      AND u.uid NOT IN (
+        SELECT friend_id FROM friends WHERE user_id = $1
+      )
+      AND u.uid NOT IN (
+        SELECT to_uid FROM friend_requests
+        WHERE from_uid = $1 AND status = 'pending'
+      )
+      AND u.uid NOT IN (
+        SELECT from_uid FROM friend_requests
+        WHERE to_uid = $1 AND status = 'pending'
+      )
+      ORDER BY RANDOM()
+      LIMIT 5
+      `,
+      [uid]
+    );
+
+    setShortCache(res, 5);
+
+    res.json({
+      suggestions: result.rows,
+    });
+  } catch (e) {
+    console.error("GET SUGGESTIONS ERROR:", e);
+    res.status(500).json({
+      suggestions: [],
+      error: e.message,
+    });
+  }
+});
+
+// Gửi socket để client tự reload bạn bè khi có thay đổi
+function notifyFriendChanged(uid) {
+  if (!uid) return;
+
+  const sockets = onlineUsers.get(uid);
+  if (!sockets) return;
+
+  for (const socketId of sockets) {
+    io.to(socketId).emit("friend_updated", {
+      uid,
+      updatedAt: Date.now(),
+    });
+  }
+}
 
 // =========================
 // DELETE USER
