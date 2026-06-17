@@ -829,13 +829,7 @@ server.listen(PORT, () => {
 
 app.post("/users/sync", async (req, res) => {
   try {
-    const {
-      uid,
-      name,
-      email,
-      avatar = "",
-      loginType = "email",
-    } = req.body;
+    const { uid, name, email, avatar = "" } = req.body;
 
     if (!uid || !email) {
       return res.status(400).json({
@@ -850,19 +844,9 @@ app.post("/users/sync", async (req, res) => {
       `
       INSERT INTO users
       (
-        uid,
-        name,
-        email,
-        player_id,
-        avatar,
-        score,
-        rank,
-        stars,
-        is_vip,
-        is_admin,
-        is_online,
-        created_at,
-        updated_at
+        uid, name, email, player_id, avatar,
+        score, rank, stars, is_vip, is_admin, is_online,
+        created_at, updated_at
       )
       VALUES
       ($1,$2,$3,$4,$5,300,0,0,false,false,false,NOW(),NOW())
@@ -870,17 +854,11 @@ app.post("/users/sync", async (req, res) => {
       DO UPDATE SET
         name = EXCLUDED.name,
         email = EXCLUDED.email,
-        avatar = EXCLUDED.avatar,
+        avatar = COALESCE(NULLIF(EXCLUDED.avatar, ''), users.avatar),
         updated_at = NOW()
       RETURNING *
       `,
-      [
-        uid,
-        name || "",
-        email || "",
-        playerId,
-        avatar || "",
-      ]
+      [uid, name || "", email || "", playerId, avatar || ""]
     );
 
     res.json({
@@ -924,66 +902,6 @@ app.get("/users/check-name", async (req, res) => {
   }
 });
 
-// =========================
-// GET USER BY UID
-// =========================
-
-app.post("/users/sync", async (req, res) => {
-  try {
-    const { uid, name, email, avatar = "" } = req.body;
-
-    if (!uid || !email) {
-      return res.status(400).json({
-        success: false,
-        message: "Thiếu uid hoặc email",
-      });
-    }
-
-    const playerId = uid.substring(0, 8).toUpperCase();
-
-    const result = await pool.query(
-      `
-      INSERT INTO users
-      (
-        uid,
-        name,
-        email,
-        player_id,
-        avatar,
-        score,
-        rank,
-        stars,
-        is_vip,
-        is_admin,
-        is_online,
-        created_at,
-        updated_at
-      )
-      VALUES
-      ($1,$2,$3,$4,$5,300,0,0,false,false,false,NOW(),NOW())
-      ON CONFLICT (uid)
-      DO UPDATE SET
-        name = EXCLUDED.name,
-        email = EXCLUDED.email,
-        avatar = "COALESCE(NULLIF(EXCLUDED.avatar, ''), users.avatar)",
-        updated_at = NOW()
-      RETURNING *
-      `,
-      [uid, name || "", email || "", playerId, avatar || ""]
-    );
-
-    res.json({
-      success: true,
-      user: result.rows[0],
-    });
-  } catch (e) {
-    console.error("sync user error:", e);
-    res.status(500).json({
-      success: false,
-      message: e.message,
-    });
-  }
-});
 
 // =========================
 // GET USER BY NAME
@@ -1180,7 +1098,7 @@ app.patch("/users/:uid/profile", async (req, res) => {
     const { uid } = req.params;
     const name = req.body.name;
     const playerId = req.body.playerId || req.body.player_id;
-    const avatar = req.body.avatar || "";
+    const avatar = req.body.avatar ?? null;
 
     if (!name || !playerId) {
       return res.status(400).json({ error: "MISSING_FIELDS" });
@@ -1207,7 +1125,7 @@ app.patch("/users/:uid/profile", async (req, res) => {
       SET 
         name = $1,
         player_id = $2,
-        avatar = $3,
+        avatar = COALESCE(NULLIF($3, ''), avatar),
         updated_at = NOW()
       WHERE uid = $4
       RETURNING *
