@@ -976,36 +976,23 @@ io.on("connection", (socket) => {
   // GAME STATUS
   // =========================
 
-  socket.on("set_player_ready", async ({ roomId, uid, isReady }) => {
-    try {
-      const room = await getGameRoom(roomId);
-      if (!room) return;
+  // SAU — emit thẳng, bỏ round-trip thứ 2
+socket.on("set_player_ready", async ({ roomId, uid, isReady }) => {
+  const room = await getGameRoom(roomId);
+  if (!room) return;
 
-      const players = room.players.map((p) =>
-        p.userId === uid
-          ? {
-            ...p,
-            isReady,
-            isFinished: isReady ? false : p.isFinished,
-          }
-          : p
-      );
+  const players = await enrichPlayersWithAvatar(
+    room.players.map((p) =>
+      p.userId === uid ? { ...p, isReady, isFinished: isReady ? false : p.isFinished } : p
+    )
+  );
 
-      await pool.query(
-        `
-        UPDATE game_rooms
-        SET players = $1::jsonb,
-            updated_at = NOW()
-        WHERE room_id = $2
-        `,
-        [JSON.stringify(players), roomId]
-      );
+  await pool.query(`UPDATE game_rooms SET players=$1::jsonb, updated_at=NOW() WHERE room_id=$2`,
+    [JSON.stringify(players), roomId]);
 
-      await emitRoomUpdated(roomId);
-    } catch (error) {
-      console.error("set_player_ready error:", error);
-    }
-  });
+  // Emit thẳng từ data đã có, không query lại
+  io.to(roomId).emit("room_updated", { ...room, players, updatedAt: Date.now() });
+});
 
   socket.on("start_game_with_reset", async ({ roomId }) => {
     try {
