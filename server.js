@@ -293,6 +293,75 @@ async function getGameRoom(roomId) {
   return roomRowToClient(result.rows[0]);
 }
 
+app.get("/users/:uid/room-create-count", async (req, res) => {
+  try {
+    const { uid } = req.params;
+
+    const result = await pool.query(
+      `
+      SELECT room_creation_dates
+      FROM users
+      WHERE uid = $1
+      LIMIT 1
+      `,
+      [uid]
+    );
+
+    const raw = result.rows[0]?.room_creation_dates || [];
+    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+
+    const recent = raw.filter((d) => {
+      const time = new Date(d).getTime();
+      return !Number.isNaN(time) && time > cutoff;
+    });
+
+    await pool.query(
+      `
+      UPDATE users
+      SET room_creation_dates = $1::jsonb,
+          updated_at = NOW()
+      WHERE uid = $2
+      `,
+      [JSON.stringify(recent), uid]
+    );
+
+    res.json({
+      count: recent.length,
+      dates: recent,
+    });
+  } catch (e) {
+    res.status(500).json({
+      count: 0,
+      error: e.message,
+    });
+  }
+});
+
+app.post("/users/:uid/record-room-create", async (req, res) => {
+  try {
+    const { uid } = req.params;
+    const now = new Date().toISOString();
+
+    await pool.query(
+      `
+      UPDATE users
+      SET room_creation_dates =
+        COALESCE(room_creation_dates, '[]'::jsonb) || $1::jsonb,
+        updated_at = NOW()
+      WHERE uid = $2
+      `,
+      [JSON.stringify([now]), uid]
+    );
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({
+      success: false,
+      error: e.message,
+    });
+  }
+});
+
 async function emitRoomUpdated(roomId) {
   const latestRoom = await getGameRoom(roomId);
   if (!latestRoom) return;
