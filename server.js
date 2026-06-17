@@ -3,12 +3,24 @@ const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
 const { admin, db } = require("./firebase");
-
-
 const pool = require("./db");
+
 const app = express();
+
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
+
+function setNoStore(res) {
+  res.set("Cache-Control", "no-store");
+}
+
+function setShortCache(res, seconds = 5) {
+  res.set("Cache-Control", `public, max-age=${seconds}`);
+}
+
+app.get("/", (req, res) => {
+  res.send("Dovui Server Running");
+});
 
 app.get("/test-db", async (req, res) => {
   try {
@@ -25,9 +37,10 @@ app.get("/test-db", async (req, res) => {
   }
 });
 
-pool.query("SELECT NOW()")
+pool
+  .query("SELECT NOW()")
   .then(() => console.log("POSTGRES CONNECTED"))
-  .catch(err => console.error("POSTGRES ERROR", err));
+  .catch((err) => console.error("POSTGRES ERROR", err));
 
 const server = http.createServer(app);
 
@@ -73,11 +86,70 @@ function getFriendChatId(uid1, uid2) {
 function generateRoomId() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let id = "";
+
   for (let i = 0; i < 6; i++) {
     id += chars[Math.floor(Math.random() * chars.length)];
   }
+
   return id;
 }
+
+async function createRoomWithRetry(buildRoomData, maxRetry = 5) {
+  for (let i = 0; i < maxRetry; i++) {
+    const roomId = generateRoomId();
+    const roomRef = db.collection("rooms").doc(roomId);
+    const snap = await roomRef.get();
+
+    if (!snap.exists) {
+      const roomData = buildRoomData(roomId);
+      await roomRef.set(roomData);
+
+      return {
+        roomId,
+        roomData,
+      };
+    }
+  }
+
+  throw new Error("CREATE_ROOM_FAILED");
+}
+
+async function getTopLeaderboard() {
+  const result = await pool.query(`
+    SELECT
+      uid,
+      name,
+      player_id,
+      avatar,
+      score,
+      is_vip,
+      is_admin,
+      RANK() OVER (ORDER BY score DESC) AS rank
+    FROM users
+    ORDER BY score DESC
+    LIMIT 10
+  `);
+
+  return result.rows;
+}
+
+function leaderboardKey(list) {
+  return list.map((u) => `${u.uid}:${u.score}:${u.rank}`).join("|");
+}
+
+async function emitLeaderboardIfChanged(beforeTop) {
+  const afterTop = await getTopLeaderboard();
+
+  if (leaderboardKey(beforeTop) !== leaderboardKey(afterTop)) {
+    io.emit("leaderboard_updated", afterTop);
+  }
+
+  return afterTop;
+}
+
+// =========================
+// SOCKET
+// =========================
 io.on("connection", (socket) => {
   console.log("Connected:", socket.id);
 
@@ -97,8 +169,6 @@ io.on("connection", (socket) => {
     socket.emit("online_users", getOnlineUserIds());
   });
 
-  //FREND CHAT EVENTS
-
   socket.on("send_message", ({ roomId, message }) => {
     if (!roomId || !message) return;
 
@@ -109,6 +179,7 @@ io.on("connection", (socket) => {
     };
 
     const room = rooms.get(roomId);
+
     if (room) {
       room.messages.push(msg);
 
@@ -142,6 +213,7 @@ io.on("connection", (socket) => {
     if (!room) return;
 
     const player = room.players.find((p) => p.uid === uid);
+
     if (player) {
       player.score = score;
     }
@@ -149,128 +221,141 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("room_updated", room);
   });
 
-  // =========================
-  // JOIN FRIEND CHAT
-  // =========================
   socket.on("join_friend_chat", async ({ currentUserId, friendId }) => {
-    if (!currentUserId || !friendId) return;
+    try {
+      if (!currentUserId || !friendId) return;
 
-    const chatId = getFriendChatId(currentUserId, friendId);
+      const chatId = getFriendChatId(currentUserId, friendId);
 
-    socket.join(chatId);
-    socket.activeChatId = chatId;
+      socket.join(chatId);
+      socket.activeChatId = chatId;
 
-    const result = await pool.query(
-      `
-    SELECT *
-    FROM messages
-    WHERE chat_id = $1
-    ORDER BY created_at DESC
-    LIMIT 50
-    `,
-      [chatId]
-    );
+      const result = await pool.query(
+        `
+        SELECT
+          id,
+          chat_id,
+          sender_id,
+          receiver_id,
+          text,
+          type,
+          media_url,
+          is_read,
+          created_at
+        FROM messages
+        WHERE chat_id = $1
+        ORDER BY created_at DESC
+        LIMIT 50
+        `,
+        [chatId]
+      );
 
-    const messages = result.rows.map((row) => ({
-      id: row.id.toString(),
-      chatId: row.chat_id,
-      senderId: row.sender_id,
-      receiverId: row.receiver_id,
-      text: row.text || "",
-      type: row.type || "text",
-      mediaUrl: row.media_url || "",
-      isRead: row.is_read === true,
-      createdAt: new Date(row.created_at).getTime(),
-    }));
+      const messages = result.rows.map((row) => ({
+        id: row.id.toString(),
+        chatId: row.chat_id,
+        senderId: row.sender_id,
+        receiverId: row.receiver_id,
+        text: row.text || "",
+        type: row.type || "text",
+        mediaUrl: row.media_url || "",
+        isRead: row.is_read === true,
+        createdAt: new Date(row.created_at).getTime(),
+      }));
 
-    socket.emit("friend_messages", messages);
+      socket.emit("friend_messages", messages);
+    } catch (error) {
+      console.error("join_friend_chat error:", error);
+    }
   });
 
-  // =========================
-  // SEND FRIEND MESSAGE
-  // =========================
   socket.on("send_friend_message", async ({ currentUserId, friendId, text }) => {
-    console.log("🔥 SEND FRIEND MESSAGE EVENT HIT:", {
-    currentUserId,
-    friendId,
-    text,
+    try {
+      if (!currentUserId || !friendId || !text?.trim()) return;
+
+      const chatId = getFriendChatId(currentUserId, friendId);
+
+      const receiverOnline = onlineUsers.has(friendId);
+
+      const receiverInChat =
+        receiverOnline &&
+        (() => {
+          const sockets = onlineUsers.get(friendId);
+
+          for (const sid of sockets) {
+            const s = io.sockets.sockets.get(sid);
+            if (s?.activeChatId === chatId) return true;
+          }
+
+          return false;
+        })();
+
+      const result = await pool.query(
+        `
+        INSERT INTO messages
+        (chat_id, sender_id, receiver_id, text, type, is_read)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING
+          id,
+          chat_id,
+          sender_id,
+          receiver_id,
+          text,
+          type,
+          media_url,
+          is_read,
+          created_at
+        `,
+        [
+          chatId,
+          currentUserId,
+          friendId,
+          text.trim(),
+          "text",
+          receiverInChat,
+        ]
+      );
+
+      await pool.query(
+        `
+        INSERT INTO friend_chats
+        (chat_id, user1_id, user2_id, last_message, updated_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        ON CONFLICT (chat_id)
+        DO UPDATE SET
+          last_message = EXCLUDED.last_message,
+          updated_at = NOW()
+        `,
+        [chatId, currentUserId, friendId, text.trim()]
+      );
+
+      const row = result.rows[0];
+
+      const message = {
+        id: row.id.toString(),
+        chatId: row.chat_id,
+        senderId: row.sender_id,
+        receiverId: row.receiver_id,
+        text: row.text || "",
+        type: row.type || "text",
+        mediaUrl: row.media_url || "",
+        isRead: row.is_read === true,
+        createdAt: new Date(row.created_at).getTime(),
+      };
+
+      io.to(chatId).emit("new_friend_message", message);
+    } catch (error) {
+      console.error("send_friend_message error:", error);
+    }
   });
-    if (!currentUserId || !friendId || !text?.trim()) return;
 
-    const chatId = getFriendChatId(currentUserId, friendId);
+  socket.on("mark_friend_messages_read", async ({ currentUserId, friendId }) => {
+    try {
+      if (!currentUserId || !friendId) return;
 
-    const receiverOnline = onlineUsers.has(friendId);
+      const chatId = getFriendChatId(currentUserId, friendId);
 
-    const receiverInChat = receiverOnline && (() => {
-      const sockets = onlineUsers.get(friendId);
-      for (const sid of sockets) {
-        const s = io.sockets.sockets.get(sid);
-        if (s?.activeChatId === chatId) return true;
-      }
-      return false;
-    })();
-    console.log("🔥 INSERT TO POSTGRES:", chatId);
-    const result = await pool.query(
-      `
-    INSERT INTO messages
-    (chat_id, sender_id, receiver_id, text, type, is_read)
-    VALUES ($1, $2, $3, $4, $5, $6)
-    RETURNING *
-    `,
-      [
-        chatId,
-        currentUserId,
-        friendId,
-        text.trim(),
-        "text",
-        receiverInChat,
-      ]
-    );
-    console.log("✅ INSERT SUCCESS:", result.rows[0]);
-
-    await pool.query(
-      `
-    INSERT INTO friend_chats 
-    (chat_id, user1_id, user2_id, last_message, updated_at)
-    VALUES ($1, $2, $3, $4, NOW())
-    ON CONFLICT (chat_id)
-    DO UPDATE SET
-      last_message = EXCLUDED.last_message,
-      updated_at = NOW()
-    `,
-      [chatId, currentUserId, friendId, text.trim()]
-    );
-
-    const row = result.rows[0];
-
-    const message = {
-      id: row.id.toString(),
-      chatId: row.chat_id,
-      senderId: row.sender_id,
-      receiverId: row.receiver_id,
-      text: row.text || "",
-      type: row.type || "text",
-      mediaUrl: row.media_url || "",
-      isRead: row.is_read === true,
-      createdAt: new Date(row.created_at).getTime(),
-    };
-
-    io.to(chatId).emit("new_friend_message", message);
-  });
-
-  // =========================
-  // MARK MESSAGES READ
-  // =========================
-  socket.on(
-    "mark_friend_messages_read",
-    async ({ currentUserId, friendId }) => {
-      try {
-        if (!currentUserId || !friendId) return;
-
-        const chatId = getFriendChatId(currentUserId, friendId);
-
-        const result = await pool.query(
-          `
+      const result = await pool.query(
+        `
         UPDATE messages
         SET is_read = true
         WHERE chat_id = $1
@@ -278,26 +363,20 @@ io.on("connection", (socket) => {
         AND is_read = false
         RETURNING id
         `,
-          [chatId, currentUserId]
-        );
+        [chatId, currentUserId]
+      );
 
-        // Chỉ emit nếu thực sự có tin nhắn được update
-        if (result.rowCount > 0) {
-          io.to(chatId).emit("friend_messages_read", {
-            chatId,
-            readerId: currentUserId,
-          });
-        }
-      } catch (error) {
-        console.error("mark_friend_messages_read error:", error);
+      if (result.rowCount > 0) {
+        io.to(chatId).emit("friend_messages_read", {
+          chatId,
+          readerId: currentUserId,
+        });
       }
+    } catch (error) {
+      console.error("mark_friend_messages_read error:", error);
     }
-  );
+  });
 
-  //ROOM EVENTS
-  // =========================
-  // CREATE GAME ROOM
-  // =========================
   socket.on("create_game_room", async (data, callback) => {
     try {
       const {
@@ -320,8 +399,8 @@ io.on("connection", (socket) => {
 
       const now = Date.now();
 
-      const { roomId, roomData } = await createRoomWithRetry((roomId) => ({
-        roomId,
+      const { roomId, roomData } = await createRoomWithRetry((newRoomId) => ({
+        roomId: newRoomId,
         hostId: uid,
         hostName: displayName,
         categoryId,
@@ -373,9 +452,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // =========================
-  // JOIN GAME ROOM
-  // =========================
   socket.on("join_game_room", async (data, callback) => {
     try {
       const {
@@ -434,17 +510,17 @@ io.on("connection", (socket) => {
         const newPlayers = alreadyInRoom
           ? players
           : [
-            ...players,
-            {
-              userId: uid,
-              displayName,
-              score: 0,
-              isHost: false,
-              isReady: false,
-              isFinished: false,
-              joinedAt: Date.now(),
-            },
-          ];
+              ...players,
+              {
+                userId: uid,
+                displayName,
+                score: 0,
+                isHost: false,
+                isReady: false,
+                isFinished: false,
+                joinedAt: Date.now(),
+              },
+            ];
 
         const kickedUserIds = Array.isArray(room.kickedUserIds)
           ? room.kickedUserIds.filter((id) => id !== uid)
@@ -498,9 +574,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // =========================
-  // LEAVE GAME ROOM
-  // =========================
   socket.on("leave_game_room", async (data, callback) => {
     try {
       const { roomId, uid } = data;
@@ -540,20 +613,23 @@ io.on("connection", (socket) => {
         });
 
         setTimeout(async () => {
-          const messagesSnap = await roomRef.collection("messages").get();
+          try {
+            const messagesSnap = await roomRef.collection("messages").get();
+            const batch = db.batch();
 
-          const batch = db.batch();
+            messagesSnap.forEach((doc) => {
+              batch.delete(doc.ref);
+            });
 
-          messagesSnap.forEach((doc) => {
-            batch.delete(doc.ref);
-          });
+            batch.delete(roomRef);
 
-          batch.delete(roomRef);
+            await batch.commit();
 
-          await batch.commit();
-
-          rooms.delete(roomId);
-          io.in(roomId).socketsLeave(roomId);
+            rooms.delete(roomId);
+            io.in(roomId).socketsLeave(roomId);
+          } catch (error) {
+            console.error("delete room after host left error:", error);
+          }
         }, 500);
 
         return;
@@ -578,6 +654,7 @@ io.on("connection", (socket) => {
       });
     } catch (error) {
       console.error("leave_game_room error:", error);
+
       callback?.({
         success: false,
         message: "Không thể rời phòng",
@@ -585,9 +662,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // =========================
-  // KICK PLAYER
-  // =========================
   socket.on("kick_player", async (data, callback) => {
     try {
       const { roomId, uid, targetUserId } = data;
@@ -647,6 +721,7 @@ io.on("connection", (socket) => {
       });
     } catch (error) {
       console.error("kick_player error:", error);
+
       callback?.({
         success: false,
         message: "Không thể kick người chơi",
@@ -654,9 +729,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // =========================
-  // CLOSE GAME ROOM
-  // =========================
   socket.on("close_game_room", async (data, callback) => {
     try {
       const { roomId, uid } = data;
@@ -696,12 +768,17 @@ io.on("connection", (socket) => {
       });
 
       setTimeout(async () => {
-        await roomRef.delete();
-        rooms.delete(roomId);
-        io.in(roomId).socketsLeave(roomId);
+        try {
+          await roomRef.delete();
+          rooms.delete(roomId);
+          io.in(roomId).socketsLeave(roomId);
+        } catch (error) {
+          console.error("close_game_room delete error:", error);
+        }
       }, 500);
     } catch (error) {
       console.error("close_game_room error:", error);
+
       callback?.({
         success: false,
         message: "Không thể đóng phòng",
@@ -709,9 +786,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // =========================
-  // OLD ROOM CHAT
-  // =========================
   socket.on("join_room", ({ roomId, uid, name }) => {
     if (!roomId || !uid) return;
 
@@ -728,6 +802,7 @@ io.on("connection", (socket) => {
     const room = rooms.get(roomId);
 
     const exists = room.players.some((p) => p.uid === uid);
+
     if (!exists) {
       room.players.push({
         uid,
@@ -758,6 +833,49 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("room_updated", room);
   });
 
+  socket.on("join-room-chat", ({ roomId }) => {
+    if (!roomId) return;
+    socket.join(`room_chat_${roomId}`);
+  });
+
+  socket.on("leave-room-chat", ({ roomId }) => {
+    if (!roomId) return;
+    socket.leave(`room_chat_${roomId}`);
+  });
+
+  socket.on("send-room-message", async (data) => {
+    try {
+      const { roomId, userId, displayName, text } = data;
+
+      if (!roomId || !userId || !text?.trim()) return;
+
+      const now = new Date();
+
+      const messageForSocket = {
+        roomId,
+        userId,
+        displayName: displayName || "Ẩn danh",
+        text: text.trim(),
+        sentAt: now.toISOString(),
+      };
+
+      await db
+        .collection("rooms")
+        .doc(roomId)
+        .collection("messages")
+        .add({
+          userId,
+          displayName: displayName || "Ẩn danh",
+          text: text.trim(),
+          sentAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+      io.to(`room_chat_${roomId}`).emit("room-message", messageForSocket);
+    } catch (error) {
+      console.error("send-room-message error:", error);
+    }
+  });
+
   socket.on("disconnect", () => {
     const uid = socket.uid;
 
@@ -774,93 +892,10 @@ io.on("connection", (socket) => {
 
     console.log("Disconnected:", socket.id);
   });
-
-  socket.on("join-room-chat", ({ roomId }) => {
-    socket.join(`room_chat_${roomId}`);
-  });
-
-  socket.on("leave-room-chat", ({ roomId }) => {
-    socket.leave(`room_chat_${roomId}`);
-  });
-
-  socket.on("send-room-message", async (data) => {
-    const { roomId, userId, displayName, text } = data;
-
-    if (!roomId || !userId || !text?.trim()) return;
-
-    const now = new Date();
-
-    const messageForSocket = {
-      roomId,
-      userId,
-      displayName: displayName || "Ẩn danh",
-      text: text.trim(),
-      sentAt: now.toISOString(),
-    };
-
-    await db
-      .collection("rooms")
-      .doc(roomId)
-      .collection("messages")
-      .add({
-        userId,
-        displayName: displayName || "Ẩn danh",
-        text: text.trim(),
-        sentAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-    io.to(`room_chat_${roomId}`).emit("room-message", messageForSocket);
-  });
-
 });
-app.get("/", (req, res) => {
-  res.send("Dovui Server Running");
-});
-
-const PORT = process.env.PORT || 3000;
-
-server.listen(PORT, () => {
-  console.log(`Server running on ${PORT}`);
-});
-
-
-
-async function getTopLeaderboard() {
-  const result = await pool.query(`
-    SELECT
-      uid,
-      name,
-      player_id,
-      avatar,
-      score,
-      stars,
-      is_vip,
-      is_admin,
-      RANK() OVER (ORDER BY score DESC) AS rank
-    FROM users
-    ORDER BY score DESC
-    LIMIT 10
-  `);
-
-  return result.rows;
-}
-
-function leaderboardKey(list) {
-  return list.map(u => `${u.uid}:${u.score}:${u.rank}`).join("|");
-}
-
-async function emitLeaderboardIfChanged(beforeTop) {
-  const afterTop = await getTopLeaderboard();
-
-  if (leaderboardKey(beforeTop) !== leaderboardKey(afterTop)) {
-    io.emit("leaderboard_updated", afterTop);
-  }
-
-  return afterTop;
-}
 
 // =========================
-// USER ROUTES - OPTIMIZED ORDER
+// USER ROUTES
 // =========================
 
 // 1. SYNC USER
@@ -881,38 +916,76 @@ app.post("/users/sync", async (req, res) => {
       `
       INSERT INTO users
       (
-        uid, name, email, player_id, avatar,
-        score, rank, stars, is_vip, is_admin, is_online,
-        created_at, updated_at
+        uid,
+        name,
+        email,
+        player_id,
+        avatar,
+        score,
+        is_vip,
+        is_admin,
+        is_online,
+        created_at,
+        updated_at
       )
       VALUES
-      ($1,$2,$3,$4,$5,300,0,0,false,false,false,NOW(),NOW())
+      ($1, $2, $3, $4, $5, 300, false, false, false, NOW(), NOW())
       ON CONFLICT (uid)
       DO UPDATE SET
         name = EXCLUDED.name,
         email = EXCLUDED.email,
         avatar = COALESCE(NULLIF(EXCLUDED.avatar, ''), users.avatar),
         updated_at = NOW()
-      RETURNING *
+      RETURNING
+        uid,
+        name,
+        email,
+        player_id,
+        avatar,
+        score,
+        is_vip,
+        is_admin,
+        is_online,
+        last_seen,
+        created_at,
+        updated_at
       `,
       [uid, name || "", email || "", playerId, avatar || ""]
     );
 
-    res.json({ success: true, user: result.rows[0] });
+    setNoStore(res);
+
+    res.json({
+      success: true,
+      user: result.rows[0],
+    });
   } catch (e) {
     console.error("SYNC USER ERROR:", e);
-    res.status(500).json({ success: false, message: e.message });
+
+    res.status(500).json({
+      success: false,
+      message: e.message,
+    });
   }
 });
 
-// 2. LEADERBOARD - PHẢI TRƯỚC /users/:uid
+// 2. LEADERBOARD
 app.get("/users/leaderboard", async (req, res) => {
   try {
     const users = await getTopLeaderboard();
-    res.json({ users });
+
+    setShortCache(res, 5);
+
+    res.json({
+      users,
+    });
   } catch (err) {
     console.error("LEADERBOARD ERROR:", err);
-    res.status(500).json({ users: [], error: err.message });
+
+    res.status(500).json({
+      users: [],
+      error: err.message,
+    });
   }
 });
 
@@ -920,9 +993,17 @@ app.get("/users/leaderboard", async (req, res) => {
 app.get("/users/count", async (req, res) => {
   try {
     const result = await pool.query("SELECT COUNT(*) FROM users");
-    res.json({ count: Number(result.rows[0].count) });
+
+    setShortCache(res, 10);
+
+    res.json({
+      count: Number(result.rows[0].count),
+    });
   } catch (e) {
-    res.status(500).json({ count: 0, message: e.message });
+    res.status(500).json({
+      count: 0,
+      message: e.message,
+    });
   }
 });
 
@@ -930,16 +1011,31 @@ app.get("/users/count", async (req, res) => {
 app.get("/users/check-name", async (req, res) => {
   try {
     const name = req.query.name?.trim();
-    if (!name) return res.json({ exists: false });
+
+    if (!name) {
+      return res.json({
+        exists: false,
+      });
+    }
 
     const result = await pool.query(
-      "SELECT uid FROM users WHERE LOWER(name) = LOWER($1) LIMIT 1",
+      `
+      SELECT uid
+      FROM users
+      WHERE LOWER(name) = LOWER($1)
+      LIMIT 1
+      `,
       [name]
     );
 
-    res.json({ exists: result.rows.length > 0 });
+    res.json({
+      exists: result.rows.length > 0,
+    });
   } catch (e) {
-    res.status(500).json({ exists: false, message: e.message });
+    res.status(500).json({
+      exists: false,
+      message: e.message,
+    });
   }
 });
 
@@ -949,16 +1045,26 @@ app.get("/users/check-player-id", async (req, res) => {
     const playerId = req.query.playerId?.trim();
 
     if (!playerId) {
-      return res.status(400).json({ error: "MISSING_PLAYER_ID" });
+      return res.status(400).json({
+        error: "MISSING_PLAYER_ID",
+      });
     }
 
     const result = await pool.query(
-      "SELECT uid FROM users WHERE LOWER(player_id) = LOWER($1) LIMIT 1",
+      `
+      SELECT uid
+      FROM users
+      WHERE LOWER(player_id) = LOWER($1)
+      LIMIT 1
+      `,
       [playerId]
     );
 
     if (result.rows.length === 0) {
-      return res.json({ exists: false, uid: null });
+      return res.json({
+        exists: false,
+        uid: null,
+      });
     }
 
     res.json({
@@ -966,7 +1072,9 @@ app.get("/users/check-player-id", async (req, res) => {
       uid: result.rows[0].uid,
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({
+      error: err.message,
+    });
   }
 });
 
@@ -976,12 +1084,27 @@ app.get("/users/by-name/:name", async (req, res) => {
     const name = req.params.name?.trim();
 
     if (!name) {
-      return res.status(400).json({ user: null, message: "Thiếu tên" });
+      return res.status(400).json({
+        user: null,
+        message: "Thiếu tên",
+      });
     }
 
     const result = await pool.query(
       `
-      SELECT *
+      SELECT
+        uid,
+        name,
+        email,
+        player_id,
+        avatar,
+        score,
+        is_vip,
+        is_admin,
+        is_online,
+        last_seen,
+        created_at,
+        updated_at
       FROM users
       WHERE LOWER(TRIM(name)) = LOWER(TRIM($1))
       LIMIT 1
@@ -989,9 +1112,14 @@ app.get("/users/by-name/:name", async (req, res) => {
       [name]
     );
 
-    res.json({ user: result.rows[0] || null });
+    res.json({
+      user: result.rows[0] || null,
+    });
   } catch (e) {
-    res.status(500).json({ user: null, message: e.message });
+    res.status(500).json({
+      user: null,
+      message: e.message,
+    });
   }
 });
 
@@ -1004,7 +1132,9 @@ app.patch("/users/:uid/profile", async (req, res) => {
     const avatar = req.body.avatar ?? null;
 
     if (!name || !playerId) {
-      return res.status(400).json({ error: "MISSING_FIELDS" });
+      return res.status(400).json({
+        error: "MISSING_FIELDS",
+      });
     }
 
     const existing = await pool.query(
@@ -1019,7 +1149,9 @@ app.patch("/users/:uid/profile", async (req, res) => {
     );
 
     if (existing.rows.length > 0) {
-      return res.status(409).json({ error: "PLAYER_ID_EXISTS" });
+      return res.status(409).json({
+        error: "PLAYER_ID_EXISTS",
+      });
     }
 
     const result = await pool.query(
@@ -1031,19 +1163,38 @@ app.patch("/users/:uid/profile", async (req, res) => {
         avatar = COALESCE(NULLIF($3, ''), avatar),
         updated_at = NOW()
       WHERE uid = $4
-      RETURNING *
+      RETURNING
+        uid,
+        name,
+        email,
+        player_id,
+        avatar,
+        score,
+        is_vip,
+        is_admin,
+        is_online,
+        last_seen,
+        created_at,
+        updated_at
       `,
       [name, playerId, avatar, uid]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: "USER_NOT_FOUND" });
+      return res.status(404).json({
+        error: "USER_NOT_FOUND",
+      });
     }
 
-    res.json({ user: result.rows[0] });
+    res.json({
+      user: result.rows[0],
+    });
   } catch (err) {
     console.error("UPDATE PROFILE ERROR:", err);
-    res.status(500).json({ error: err.message });
+
+    res.status(500).json({
+      error: err.message,
+    });
   }
 });
 
@@ -1052,29 +1203,58 @@ app.patch("/users/:uid/score", async (req, res) => {
   try {
     const { score } = req.body;
     const { uid } = req.params;
+    const safeScore = Number(score);
+
+    if (!uid || Number.isNaN(safeScore)) {
+      return res.status(400).json({
+        success: false,
+        message: "INVALID_DATA",
+      });
+    }
 
     const beforeTop = await getTopLeaderboard();
 
     const result = await pool.query(
       `
       UPDATE users
-      SET score = $1,
-          updated_at = NOW()
+      SET
+        score = $1,
+        updated_at = NOW()
       WHERE uid = $2
-      RETURNING *
+      RETURNING
+        uid,
+        name,
+        email,
+        player_id,
+        avatar,
+        score,
+        is_vip,
+        is_admin,
+        is_online,
+        last_seen,
+        created_at,
+        updated_at
       `,
-      [score, uid]
+      [safeScore, uid]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: "USER_NOT_FOUND" });
+      return res.status(404).json({
+        error: "USER_NOT_FOUND",
+      });
     }
 
     await emitLeaderboardIfChanged(beforeTop);
 
-    res.json({ success: true, user: result.rows[0] });
+    res.json({
+      success: true,
+      user: result.rows[0],
+    });
   } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
+    res.status(500).json({
+      success: false,
+      message: e.message,
+    });
   }
 });
 
@@ -1084,21 +1264,40 @@ app.patch("/users/:uid/vip", async (req, res) => {
     const result = await pool.query(
       `
       UPDATE users
-      SET is_vip = true,
-          updated_at = NOW()
+      SET
+        is_vip = true,
+        updated_at = NOW()
       WHERE uid = $1
-      RETURNING *
+      RETURNING
+        uid,
+        name,
+        email,
+        player_id,
+        avatar,
+        score,
+        is_vip,
+        is_admin,
+        is_online,
+        last_seen,
+        created_at,
+        updated_at
       `,
       [req.params.uid]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: "USER_NOT_FOUND" });
+      return res.status(404).json({
+        error: "USER_NOT_FOUND",
+      });
     }
 
-    res.json({ user: result.rows[0] });
+    res.json({
+      user: result.rows[0],
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({
+      error: err.message,
+    });
   }
 });
 
@@ -1111,26 +1310,44 @@ app.post("/users/:uid/check-in", async (req, res) => {
     const result = await pool.query(
       `
       UPDATE users
-      SET score = score + 10,
-          stars = stars + 10,
-          last_check_in = CURRENT_DATE,
-          updated_at = NOW()
+      SET
+        score = score + 10,
+        last_check_in = CURRENT_DATE,
+        updated_at = NOW()
       WHERE uid = $1
-        AND (last_check_in IS NULL OR last_check_in < CURRENT_DATE)
-      RETURNING *
+      AND (last_check_in IS NULL OR last_check_in < CURRENT_DATE)
+      RETURNING
+        uid,
+        name,
+        email,
+        player_id,
+        avatar,
+        score,
+        is_vip,
+        is_admin,
+        is_online,
+        last_seen,
+        created_at,
+        updated_at
       `,
       [uid]
     );
 
     if (result.rows.length === 0) {
-      return res.status(400).json({ error: "ALREADY_CHECKED_IN" });
+      return res.status(400).json({
+        error: "ALREADY_CHECKED_IN",
+      });
     }
 
     await emitLeaderboardIfChanged(beforeTop);
 
-    res.json({ user: result.rows[0] });
+    res.json({
+      user: result.rows[0],
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({
+      error: err.message,
+    });
   }
 });
 
@@ -1143,26 +1360,44 @@ app.post("/users/:uid/watch-video-reward", async (req, res) => {
     const result = await pool.query(
       `
       UPDATE users
-      SET score = score + 10,
-          stars = stars + 10,
-          last_video_watch = CURRENT_DATE,
-          updated_at = NOW()
+      SET
+        score = score + 10,
+        last_video_watch = CURRENT_DATE,
+        updated_at = NOW()
       WHERE uid = $1
-        AND (last_video_watch IS NULL OR last_video_watch < CURRENT_DATE)
-      RETURNING *
+      AND (last_video_watch IS NULL OR last_video_watch < CURRENT_DATE)
+      RETURNING
+        uid,
+        name,
+        email,
+        player_id,
+        avatar,
+        score,
+        is_vip,
+        is_admin,
+        is_online,
+        last_seen,
+        created_at,
+        updated_at
       `,
       [uid]
     );
 
     if (result.rows.length === 0) {
-      return res.status(400).json({ error: "ALREADY_WATCHED_VIDEO" });
+      return res.status(400).json({
+        error: "ALREADY_WATCHED_VIDEO",
+      });
     }
 
     await emitLeaderboardIfChanged(beforeTop);
 
-    res.json({ user: result.rows[0] });
+    res.json({
+      user: result.rows[0],
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({
+      error: err.message,
+    });
   }
 });
 
@@ -1171,7 +1406,10 @@ app.get("/users/:uid/home", async (req, res) => {
   try {
     const result = await pool.query(
       `
-      SELECT name, score, created_at
+      SELECT
+        name,
+        score,
+        created_at
       FROM users
       WHERE uid = $1
       LIMIT 1
@@ -1180,7 +1418,9 @@ app.get("/users/:uid/home", async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ message: "USER_NOT_FOUND" });
+      return res.status(404).json({
+        message: "USER_NOT_FOUND",
+      });
     }
 
     const user = result.rows[0];
@@ -1189,58 +1429,178 @@ app.get("/users/:uid/home", async (req, res) => {
       (new Date() - new Date(user.created_at)) / (1000 * 60 * 60 * 24)
     );
 
+    setNoStore(res);
+
     res.json({
       name: user.name,
       score: user.score,
       days,
     });
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    res.status(500).json({
+      message: err.message,
+    });
   }
 });
 
-// 13. GET USER BY UID - ĐỂ GẦN CUỐI
+// 13. ADD SCORE
+app.post("/users/add-score", async (req, res) => {
+  try {
+    const { uid, score } = req.body;
+    const safeScore = Number(score) || 0;
+
+    if (!uid || safeScore <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: "INVALID_DATA",
+      });
+    }
+
+    const beforeTop = await getTopLeaderboard();
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET
+        score = score + $1,
+        updated_at = NOW()
+      WHERE uid = $2
+      RETURNING score
+      `,
+      [safeScore, uid]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "USER_NOT_FOUND",
+      });
+    }
+
+    await emitLeaderboardIfChanged(beforeTop);
+
+    res.json({
+      success: true,
+      score: result.rows[0].score,
+    });
+  } catch (e) {
+    res.status(500).json({
+      success: false,
+      error: e.message,
+    });
+  }
+});
+
+// 14. DEDUCT SCORE
+app.post("/users/deduct-score", async (req, res) => {
+  try {
+    const { uid, amount } = req.body;
+    const safeAmount = Number(amount) || 0;
+
+    if (!uid || safeAmount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: "INVALID_DATA",
+      });
+    }
+
+    const beforeTop = await getTopLeaderboard();
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET
+        score = score - $1,
+        updated_at = NOW()
+      WHERE uid = $2
+      AND score >= $1
+      RETURNING score
+      `,
+      [safeAmount, uid]
+    );
+
+    if (result.rowCount === 0) {
+      return res.json({
+        success: false,
+        message: "NOT_ENOUGH_SCORE",
+      });
+    }
+
+    await emitLeaderboardIfChanged(beforeTop);
+
+    res.json({
+      success: true,
+      score: result.rows[0].score,
+    });
+  } catch (e) {
+    res.status(500).json({
+      success: false,
+      error: e.message,
+    });
+  }
+});
+
+// 15. GET USER BY UID
 app.get("/users/:uid", async (req, res) => {
   try {
     const result = await pool.query(
       `
-      SELECT *
-      FROM (
-        SELECT
-          uid,
-          name,
-          email,
-          player_id,
-          avatar,
-          score,
-          stars,
-          is_vip,
-          is_admin,
-          is_online,
-          last_seen,
-          created_at,
-          updated_at,
-          RANK() OVER (ORDER BY score DESC) AS rank
-        FROM users
-      ) ranked_users
-      WHERE uid = $1
+      SELECT
+        u.uid,
+        u.name,
+        u.email,
+        u.player_id,
+        u.avatar,
+        u.score,
+        u.is_vip,
+        u.is_admin,
+        u.is_online,
+        u.last_seen,
+        u.created_at,
+        u.updated_at,
+        (
+          SELECT COUNT(*) + 1
+          FROM users x
+          WHERE x.score > u.score
+        ) AS rank
+      FROM users u
+      WHERE u.uid = $1
       LIMIT 1
       `,
       [req.params.uid]
     );
 
-    res.json({ user: result.rows[0] || null });
+    setNoStore(res);
+
+    res.json({
+      user: result.rows[0] || null,
+    });
   } catch (e) {
-    res.status(500).json({ user: null, message: e.message });
+    res.status(500).json({
+      user: null,
+      message: e.message,
+    });
   }
 });
 
-// 14. DELETE USER - CUỐI
+// 16. DELETE USER
 app.delete("/users/:uid", async (req, res) => {
   try {
     await pool.query("DELETE FROM users WHERE uid = $1", [req.params.uid]);
-    res.json({ success: true });
+
+    res.json({
+      success: true,
+    });
   } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
+    res.status(500).json({
+      success: false,
+      message: e.message,
+    });
   }
+});
+
+const PORT = process.env.PORT || 3000;
+
+server.listen(PORT, () => {
+  console.log(`Server running on ${PORT}`);
 });
