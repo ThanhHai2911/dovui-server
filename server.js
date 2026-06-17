@@ -2884,23 +2884,107 @@ function notifyFriendChanged(uid) {
 // =========================
 
 app.delete("/users/:uid", async (req, res) => {
+  const client = await pool.connect();
+
   try {
-    await pool.query(
+    const { uid } = req.params;
+
+    await client.query("BEGIN");
+
+    // Bạn bè
+    await client.query(
+      `
+      DELETE FROM friends
+      WHERE user_id = $1
+         OR friend_id = $1
+      `,
+      [uid]
+    );
+
+    // Lời mời kết bạn
+    await client.query(
+      `
+      DELETE FROM friend_requests
+      WHERE from_uid = $1
+         OR to_uid = $1
+      `,
+      [uid]
+    );
+
+    // Chat riêng
+    await client.query(
+      `
+      DELETE FROM messages
+      WHERE sender_id = $1
+         OR receiver_id = $1
+      `,
+      [uid]
+    );
+
+    await client.query(
+      `
+      DELETE FROM friend_chats
+      WHERE user1_id = $1
+         OR user2_id = $1
+      `,
+      [uid]
+    );
+
+    // Tiến trình quiz
+    await client.query(
+      `
+      DELETE FROM quiz_progress
+      WHERE uid = $1
+      `,
+      [uid]
+    );
+
+    // Tin nhắn phòng
+    await client.query(
+      `
+      DELETE FROM room_messages
+      WHERE user_id = $1
+      `,
+      [uid]
+    );
+
+    // Phòng game
+    await client.query(
+      `
+      DELETE FROM game_rooms
+      WHERE host_id = $1
+      `,
+      [uid]
+    );
+
+    // User
+    await client.query(
       `
       DELETE FROM users
       WHERE uid = $1
       `,
-      [req.params.uid]
+      [uid]
     );
+
+    await client.query("COMMIT");
+
+    // Đá user khỏi socket online
+    onlineUsers.delete(uid);
 
     res.json({
       success: true,
     });
   } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+
+    console.error("DELETE USER ERROR:", e);
+
     res.status(500).json({
       success: false,
       message: e.message,
     });
+  } finally {
+    client.release();
   }
 });
 
