@@ -498,11 +498,12 @@ io.on("connection", (socket) => {
           {
             userId: uid,
             displayName,
+            avatar,
             score: 0,
-            isHost: true,
-            isReady: true,
+            isHost: false,
+            isReady: false,
             isFinished: false,
-            joinedAt: now,
+            joinedAt: Date.now(),
           },
         ],
       }));
@@ -570,6 +571,13 @@ io.on("connection", (socket) => {
       if (room.players.length >= 8) {
         return callback?.({ success: false, message: "Phòng đã đầy" });
       }
+
+      const userResult = await pool.query(
+        `SELECT avatar FROM users WHERE uid = $1 LIMIT 1`,
+        [uid]
+      );
+
+      const avatar = userResult.rows[0]?.avatar || "";
 
       const alreadyInRoom = room.players.some((p) => p.userId === uid);
 
