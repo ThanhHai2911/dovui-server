@@ -880,13 +880,13 @@ app.get("/users/leaderboard", async (req, res) => {
         player_id,
         avatar,
         score,
+        rank,
         stars,
         is_vip,
         is_admin,
-        created_at,
-        RANK() OVER (ORDER BY score DESC) AS rank
+        created_at
       FROM users
-      ORDER BY score DESC
+      ORDER BY rank ASC
       LIMIT 10
     `);
 
