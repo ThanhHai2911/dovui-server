@@ -1583,6 +1583,134 @@ app.get("/users/:uid", async (req, res) => {
   }
 });
 
+app.post("/quiz-progress/save", async (req, res) => {
+  try {
+    const { uid, categoryId, levelId = "", questionIndex, score, lives } = req.body;
+
+    await pool.query(
+      `
+      INSERT INTO quiz_progress
+      (uid, category_id, level_id, question_index, score, lives, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, NOW())
+      ON CONFLICT (uid, category_id, level_id)
+      DO UPDATE SET
+        question_index = EXCLUDED.question_index,
+        score = EXCLUDED.score,
+        lives = EXCLUDED.lives,
+        updated_at = NOW()
+      `,
+      [uid, categoryId, levelId, questionIndex, score, lives]
+    );
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/quiz-progress/load", async (req, res) => {
+  try {
+    const { uid, categoryId, levelId = "" } = req.query;
+
+    const result = await pool.query(
+      `
+      SELECT question_index, score, lives
+      FROM quiz_progress
+      WHERE uid = $1 AND category_id = $2 AND level_id = $3
+      LIMIT 1
+      `,
+      [uid, categoryId, levelId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ progress: null });
+    }
+
+    res.json({
+      progress: {
+        questionIndex: result.rows[0].question_index,
+        score: result.rows[0].score,
+        lives: result.rows[0].lives,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ progress: null, error: e.message });
+  }
+});
+
+app.post("/quiz-progress/save", async (req, res) => {
+  try {
+    const { uid, categoryId, levelId = "", questionIndex, score, lives } = req.body;
+
+    await pool.query(
+      `
+      INSERT INTO quiz_progress
+      (uid, category_id, level_id, question_index, score, lives, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, NOW())
+      ON CONFLICT (uid, category_id, level_id)
+      DO UPDATE SET
+        question_index = EXCLUDED.question_index,
+        score = EXCLUDED.score,
+        lives = EXCLUDED.lives,
+        updated_at = NOW()
+      `,
+      [uid, categoryId, levelId, questionIndex, score, lives]
+    );
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get("/quiz-progress/load", async (req, res) => {
+  try {
+    const { uid, categoryId, levelId = "" } = req.query;
+
+    const result = await pool.query(
+      `
+      SELECT question_index, score, lives
+      FROM quiz_progress
+      WHERE uid = $1 AND category_id = $2 AND level_id = $3
+      LIMIT 1
+      `,
+      [uid, categoryId, levelId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ progress: null });
+    }
+
+    res.json({
+      progress: {
+        questionIndex: result.rows[0].question_index,
+        score: result.rows[0].score,
+        lives: result.rows[0].lives,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ progress: null, error: e.message });
+  }
+});
+
+app.delete("/quiz-progress/clear", async (req, res) => {
+  try {
+    const { uid, categoryId, levelId = "" } = req.body;
+
+    await pool.query(
+      `
+      DELETE FROM quiz_progress
+      WHERE uid = $1 AND category_id = $2 AND level_id = $3
+      `,
+      [uid, categoryId, levelId]
+    );
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // 16. DELETE USER
 app.delete("/users/:uid", async (req, res) => {
   try {
