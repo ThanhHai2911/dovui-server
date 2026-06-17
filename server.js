@@ -97,17 +97,60 @@ function generateRoomId() {
 async function createRoomWithRetry(buildRoomData, maxRetry = 5) {
   for (let i = 0; i < maxRetry; i++) {
     const roomId = generateRoomId();
-    const roomRef = db.collection("rooms").doc(roomId);
-    const snap = await roomRef.get();
 
-    if (!snap.exists) {
+    const exists = await pool.query(
+      `SELECT room_id FROM game_rooms WHERE room_id = $1 LIMIT 1`,
+      [roomId]
+    );
+
+    if (exists.rows.length === 0) {
       const roomData = buildRoomData(roomId);
-      await roomRef.set(roomData);
 
-      return {
-        roomId,
-        roomData,
-      };
+      await pool.query(
+        `
+        INSERT INTO game_rooms
+        (
+          room_id,
+          host_id,
+          host_name,
+          category_id,
+          category_name,
+          type,
+          password,
+          question_count,
+          time_per_question,
+          status,
+          players,
+          invited_users,
+          kicked_user_ids,
+          started_at,
+          current_level_id,
+          created_at,
+          updated_at
+        )
+        VALUES
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13::jsonb,$14,$15,NOW(),NOW())
+        `,
+        [
+          roomData.roomId,
+          roomData.hostId,
+          roomData.hostName,
+          roomData.categoryId,
+          roomData.categoryName,
+          roomData.type,
+          roomData.password,
+          roomData.questionCount,
+          roomData.timePerQuestion,
+          roomData.status,
+          JSON.stringify(roomData.players),
+          JSON.stringify(roomData.invitedUsers || []),
+          JSON.stringify(roomData.kickedUserIds || []),
+          roomData.startedAt || null,
+          roomData.currentLevelId || null,
+        ]
+      );
+
+      return { roomId, roomData };
     }
   }
 
@@ -377,6 +420,41 @@ io.on("connection", (socket) => {
     }
   });
 
+  function roomRowToClient(row) {
+    if (!row) return null;
+
+    return {
+      roomId: row.room_id,
+      hostId: row.host_id,
+      hostName: row.host_name,
+      categoryId: row.category_id,
+      categoryName: row.category_name || "",
+      type: row.type,
+      password: row.password || "",
+      questionCount: row.question_count,
+      timePerQuestion: row.time_per_question,
+      status: row.status,
+      players: Array.isArray(row.players) ? row.players : [],
+      invitedUsers: Array.isArray(row.invited_users) ? row.invited_users : [],
+      kickedUserIds: Array.isArray(row.kicked_user_ids)
+        ? row.kicked_user_ids
+        : [],
+      startedAt: row.started_at,
+      currentLevelId: row.current_level_id,
+      createdAt: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
+      updatedAt: row.updated_at ? new Date(row.updated_at).getTime() : Date.now(),
+    };
+  }
+
+  async function getGameRoom(roomId) {
+    const result = await pool.query(
+      `SELECT * FROM game_rooms WHERE room_id = $1 LIMIT 1`,
+      [roomId]
+    );
+
+    return roomRowToClient(result.rows[0]);
+  }
+
   socket.on("create_game_room", async (data, callback) => {
     try {
       const {
@@ -412,8 +490,10 @@ io.on("connection", (socket) => {
         status: "waiting",
         kickedUserIds: [],
         invitedUsers: [],
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        startedAt: null,
+        currentLevelId: null,
+        createdAt: now,
+        updatedAt: now,
         players: [
           {
             userId: uid,
@@ -429,26 +509,16 @@ io.on("connection", (socket) => {
 
       socket.join(roomId);
 
-      const roomForClient = {
-        ...roomData,
-        createdAt: now,
-        updatedAt: now,
-      };
-
       callback?.({
         success: true,
         roomId,
-        room: roomForClient,
+        room: roomData,
       });
 
-      io.to(roomId).emit("room_updated", roomForClient);
+      io.to(roomId).emit("room_updated", roomData);
     } catch (error) {
       console.error("create_game_room error:", error);
-
-      callback?.({
-        success: false,
-        message: "Không thể tạo phòng",
-      });
+      callback?.({ success: false, message: "Không thể tạo phòng" });
     }
   });
 
@@ -470,76 +540,73 @@ io.on("connection", (socket) => {
       }
 
       const cleanRoomId = roomId.trim().toUpperCase();
-      const roomRef = db.collection("rooms").doc(cleanRoomId);
 
-      let latestRoom = null;
+      const result = await pool.query(
+        `SELECT * FROM game_rooms WHERE room_id = $1 LIMIT 1`,
+        [cleanRoomId]
+      );
 
-      await db.runTransaction(async (transaction) => {
-        const snap = await transaction.get(roomRef);
+      if (result.rows.length === 0) {
+        return callback?.({ success: false, message: "Phòng không tồn tại" });
+      }
 
-        if (!snap.exists) {
-          throw new Error("ROOM_NOT_FOUND");
-        }
+      const room = roomRowToClient(result.rows[0]);
 
-        const room = snap.data();
+      if (room.status !== "waiting") {
+        return callback?.({ success: false, message: "Phòng đã bắt đầu" });
+      }
 
-        if (room.status !== "waiting") {
-          throw new Error("ROOM_NOT_WAITING");
-        }
-
-        const invitedUsers = Array.isArray(room.invitedUsers)
-          ? room.invitedUsers
-          : [];
-
-        if (isDirectJoin && !invitedUsers.includes(uid)) {
-          throw new Error("NOT_INVITED");
-        }
-
-        if (!isDirectJoin && room.password && room.password !== password.trim()) {
-          throw new Error("WRONG_PASSWORD");
-        }
-
-        const players = Array.isArray(room.players) ? room.players : [];
-
-        if (players.length >= 8) {
-          throw new Error("ROOM_FULL");
-        }
-
-        const alreadyInRoom = players.some((p) => p.userId === uid);
-
-        const newPlayers = alreadyInRoom
-          ? players
-          : [
-              ...players,
-              {
-                userId: uid,
-                displayName,
-                score: 0,
-                isHost: false,
-                isReady: false,
-                isFinished: false,
-                joinedAt: Date.now(),
-              },
-            ];
-
-        const kickedUserIds = Array.isArray(room.kickedUserIds)
-          ? room.kickedUserIds.filter((id) => id !== uid)
-          : [];
-
-        latestRoom = {
-          ...room,
-          roomId: cleanRoomId,
-          players: newPlayers,
-          kickedUserIds,
-          updatedAt: Date.now(),
-        };
-
-        transaction.update(roomRef, {
-          players: newPlayers,
-          kickedUserIds,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      if (isDirectJoin && !room.invitedUsers.includes(uid)) {
+        return callback?.({
+          success: false,
+          message: "Bạn không có quyền tham gia phòng này",
         });
-      });
+      }
+
+      if (!isDirectJoin && room.password && room.password !== password.trim()) {
+        return callback?.({ success: false, message: "Sai mật khẩu" });
+      }
+
+      if (room.players.length >= 8) {
+        return callback?.({ success: false, message: "Phòng đã đầy" });
+      }
+
+      const alreadyInRoom = room.players.some((p) => p.userId === uid);
+
+      const newPlayers = alreadyInRoom
+        ? room.players
+        : [
+          ...room.players,
+          {
+            userId: uid,
+            displayName,
+            score: 0,
+            isHost: false,
+            isReady: false,
+            isFinished: false,
+            joinedAt: Date.now(),
+          },
+        ];
+
+      const kickedUserIds = room.kickedUserIds.filter((id) => id !== uid);
+
+      await pool.query(
+        `
+      UPDATE game_rooms
+      SET players = $1::jsonb,
+          kicked_user_ids = $2::jsonb,
+          updated_at = NOW()
+      WHERE room_id = $3
+      `,
+        [JSON.stringify(newPlayers), JSON.stringify(kickedUserIds), cleanRoomId]
+      );
+
+      const latestRoom = {
+        ...room,
+        players: newPlayers,
+        kickedUserIds,
+        updatedAt: Date.now(),
+      };
 
       socket.join(cleanRoomId);
 
@@ -551,26 +618,8 @@ io.on("connection", (socket) => {
 
       io.to(cleanRoomId).emit("room_updated", latestRoom);
     } catch (error) {
-      console.error("join_game_room error:", error.message);
-
-      let message = "Không thể vào phòng";
-
-      if (error.message === "ROOM_NOT_FOUND") {
-        message = "Phòng không tồn tại";
-      } else if (error.message === "ROOM_NOT_WAITING") {
-        message = "Phòng đã bắt đầu";
-      } else if (error.message === "WRONG_PASSWORD") {
-        message = "Sai mật khẩu";
-      } else if (error.message === "NOT_INVITED") {
-        message = "Bạn không có quyền tham gia phòng này";
-      } else if (error.message === "ROOM_FULL") {
-        message = "Phòng đã đầy";
-      }
-
-      callback?.({
-        success: false,
-        message,
-      });
+      console.error("join_game_room error:", error);
+      callback?.({ success: false, message: "Không thể vào phòng" });
     }
   });
 
@@ -585,21 +634,16 @@ io.on("connection", (socket) => {
         });
       }
 
-      const roomRef = db.collection("rooms").doc(roomId);
-      const snap = await roomRef.get();
+      const room = await getGameRoom(roomId);
 
-      if (!snap.exists) {
-        socket.leave(roomId);
+      socket.leave(roomId);
+
+      if (!room) {
         return callback?.({ success: true });
       }
 
-      const room = snap.data();
-      const players = Array.isArray(room.players) ? room.players : [];
-
-      const currentPlayer = players.find((p) => p.userId === uid);
-      const newPlayers = players.filter((p) => p.userId !== uid);
-
-      socket.leave(roomId);
+      const currentPlayer = room.players.find((p) => p.userId === uid);
+      const newPlayers = room.players.filter((p) => p.userId !== uid);
 
       if (newPlayers.length === 0 || currentPlayer?.isHost) {
         io.to(roomId).emit("room_closed", {
@@ -614,31 +658,29 @@ io.on("connection", (socket) => {
 
         setTimeout(async () => {
           try {
-            const messagesSnap = await roomRef.collection("messages").get();
-            const batch = db.batch();
-
-            messagesSnap.forEach((doc) => {
-              batch.delete(doc.ref);
-            });
-
-            batch.delete(roomRef);
-
-            await batch.commit();
+            await pool.query(`DELETE FROM game_rooms WHERE room_id = $1`, [
+              roomId,
+            ]);
 
             rooms.delete(roomId);
             io.in(roomId).socketsLeave(roomId);
           } catch (error) {
-            console.error("delete room after host left error:", error);
+            console.error("delete Neon room after host left error:", error);
           }
         }, 500);
 
         return;
       }
 
-      await roomRef.update({
-        players: newPlayers,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+      await pool.query(
+        `
+      UPDATE game_rooms
+      SET players = $1::jsonb,
+          updated_at = NOW()
+      WHERE room_id = $2
+      `,
+        [JSON.stringify(newPlayers), roomId]
+      );
 
       const latestRoom = {
         ...room,
@@ -654,11 +696,7 @@ io.on("connection", (socket) => {
       });
     } catch (error) {
       console.error("leave_game_room error:", error);
-
-      callback?.({
-        success: false,
-        message: "Không thể rời phòng",
-      });
+      callback?.({ success: false, message: "Không thể rời phòng" });
     }
   });
 
@@ -667,65 +705,51 @@ io.on("connection", (socket) => {
       const { roomId, uid, targetUserId } = data;
 
       if (!roomId || !uid || !targetUserId) {
-        return callback?.({
-          success: false,
-          message: "Thiếu dữ liệu kick",
-        });
+        return callback?.({ success: false, message: "Thiếu dữ liệu kick" });
       }
 
-      const roomRef = db.collection("rooms").doc(roomId);
-      const snap = await roomRef.get();
+      const room = await getGameRoom(roomId);
 
-      if (!snap.exists) {
-        return callback?.({
-          success: false,
-          message: "Phòng không tồn tại",
-        });
+      if (!room) {
+        return callback?.({ success: false, message: "Phòng không tồn tại" });
       }
-
-      const room = snap.data();
 
       if (room.hostId !== uid) {
-        return callback?.({
-          success: false,
-          message: "Bạn không phải chủ phòng",
-        });
+        return callback?.({ success: false, message: "Bạn không phải chủ phòng" });
       }
 
-      const players = Array.isArray(room.players) ? room.players : [];
-      const kickedUserIds = Array.isArray(room.kickedUserIds)
-        ? room.kickedUserIds
-        : [];
+      const newPlayers = room.players.filter((p) => p.userId !== targetUserId);
 
-      const newPlayers = players.filter((p) => p.userId !== targetUserId);
+      const kickedUserIds = [...room.kickedUserIds];
 
       if (!kickedUserIds.includes(targetUserId)) {
         kickedUserIds.push(targetUserId);
       }
 
-      await roomRef.update({
-        players: newPlayers,
-        kickedUserIds,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+      await pool.query(
+        `
+      UPDATE game_rooms
+      SET players = $1::jsonb,
+          kicked_user_ids = $2::jsonb,
+          updated_at = NOW()
+      WHERE room_id = $3
+      `,
+        [JSON.stringify(newPlayers), JSON.stringify(kickedUserIds), roomId]
+      );
 
-      io.to(roomId).emit("room_updated", {
+      const latestRoom = {
         ...room,
         players: newPlayers,
         kickedUserIds,
         updatedAt: Date.now(),
-      });
+      };
 
-      callback?.({
-        success: true,
-      });
+      io.to(roomId).emit("room_updated", latestRoom);
+
+      callback?.({ success: true });
     } catch (error) {
       console.error("kick_player error:", error);
-
-      callback?.({
-        success: false,
-        message: "Không thể kick người chơi",
-      });
+      callback?.({ success: false, message: "Không thể kick người chơi" });
     }
   });
 
@@ -740,22 +764,14 @@ io.on("connection", (socket) => {
         });
       }
 
-      const roomRef = db.collection("rooms").doc(roomId);
-      const snap = await roomRef.get();
+      const room = await getGameRoom(roomId);
 
-      if (!snap.exists) {
-        return callback?.({
-          success: true,
-        });
+      if (!room) {
+        return callback?.({ success: true });
       }
 
-      const room = snap.data();
-
       if (room.hostId !== uid) {
-        return callback?.({
-          success: false,
-          message: "Bạn không phải chủ phòng",
-        });
+        return callback?.({ success: false, message: "Bạn không phải chủ phòng" });
       }
 
       io.to(roomId).emit("room_closed", {
@@ -763,84 +779,21 @@ io.on("connection", (socket) => {
         reason: "HOST_CLOSED",
       });
 
-      callback?.({
-        success: true,
-      });
+      callback?.({ success: true });
 
       setTimeout(async () => {
         try {
-          await roomRef.delete();
+          await pool.query(`DELETE FROM game_rooms WHERE room_id = $1`, [roomId]);
           rooms.delete(roomId);
           io.in(roomId).socketsLeave(roomId);
         } catch (error) {
-          console.error("close_game_room delete error:", error);
+          console.error("close Neon room delete error:", error);
         }
       }, 500);
     } catch (error) {
       console.error("close_game_room error:", error);
-
-      callback?.({
-        success: false,
-        message: "Không thể đóng phòng",
-      });
+      callback?.({ success: false, message: "Không thể đóng phòng" });
     }
-  });
-
-  socket.on("join_room", ({ roomId, uid, name }) => {
-    if (!roomId || !uid) return;
-
-    socket.join(roomId);
-
-    if (!rooms.has(roomId)) {
-      rooms.set(roomId, {
-        roomId,
-        players: [],
-        messages: [],
-      });
-    }
-
-    const room = rooms.get(roomId);
-
-    const exists = room.players.some((p) => p.uid === uid);
-
-    if (!exists) {
-      room.players.push({
-        uid,
-        name,
-        score: 0,
-        isFinished: false,
-      });
-    }
-
-    io.to(roomId).emit("room_updated", room);
-  });
-
-  socket.on("leave_room", ({ roomId, uid }) => {
-    if (!roomId || !uid) return;
-
-    socket.leave(roomId);
-
-    const room = rooms.get(roomId);
-    if (!room) return;
-
-    room.players = room.players.filter((p) => p.uid !== uid);
-
-    if (room.players.length === 0) {
-      rooms.delete(roomId);
-      return;
-    }
-
-    io.to(roomId).emit("room_updated", room);
-  });
-
-  socket.on("join-room-chat", ({ roomId }) => {
-    if (!roomId) return;
-    socket.join(`room_chat_${roomId}`);
-  });
-
-  socket.on("leave-room-chat", ({ roomId }) => {
-    if (!roomId) return;
-    socket.leave(`room_chat_${roomId}`);
   });
 
   socket.on("send-room-message", async (data) => {
@@ -849,32 +802,33 @@ io.on("connection", (socket) => {
 
       if (!roomId || !userId || !text?.trim()) return;
 
-      const now = new Date();
+      const result = await pool.query(
+        `
+      INSERT INTO room_messages
+      (room_id, user_id, display_name, text, sent_at)
+      VALUES ($1, $2, $3, $4, NOW())
+      RETURNING id, room_id, user_id, display_name, text, sent_at
+      `,
+        [roomId, userId, displayName || "Ẩn danh", text.trim()]
+      );
+
+      const row = result.rows[0];
 
       const messageForSocket = {
-        roomId,
-        userId,
-        displayName: displayName || "Ẩn danh",
-        text: text.trim(),
-        sentAt: now.toISOString(),
+        id: row.id.toString(),
+        roomId: row.room_id,
+        userId: row.user_id,
+        displayName: row.display_name || "Ẩn danh",
+        text: row.text,
+        sentAt: new Date(row.sent_at).toISOString(),
       };
-
-      await db
-        .collection("rooms")
-        .doc(roomId)
-        .collection("messages")
-        .add({
-          userId,
-          displayName: displayName || "Ẩn danh",
-          text: text.trim(),
-          sentAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
 
       io.to(`room_chat_${roomId}`).emit("room-message", messageForSocket);
     } catch (error) {
       console.error("send-room-message error:", error);
     }
   });
+
 
   socket.on("disconnect", () => {
     const uid = socket.uid;
