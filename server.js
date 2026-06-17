@@ -823,6 +823,42 @@ server.listen(PORT, () => {
   console.log(`Server running on ${PORT}`);
 });
 
+
+
+async function getTopLeaderboard() {
+  const result = await pool.query(`
+    SELECT
+      uid,
+      name,
+      player_id,
+      avatar,
+      score,
+      stars,
+      is_vip,
+      is_admin,
+      RANK() OVER (ORDER BY score DESC) AS rank
+    FROM users
+    ORDER BY score DESC
+    LIMIT 10
+  `);
+
+  return result.rows;
+}
+
+function leaderboardKey(list) {
+  return list.map(u => `${u.uid}:${u.score}:${u.rank}`).join("|");
+}
+
+async function emitLeaderboardIfChanged(beforeTop) {
+  const afterTop = await getTopLeaderboard();
+
+  if (leaderboardKey(beforeTop) !== leaderboardKey(afterTop)) {
+    io.emit("leaderboard_updated", afterTop);
+  }
+
+  return afterTop;
+}
+
 // =========================
 // USER ROUTES - OPTIMIZED ORDER
 // =========================
@@ -872,25 +908,8 @@ app.post("/users/sync", async (req, res) => {
 // 2. LEADERBOARD - PHẢI TRƯỚC /users/:uid
 app.get("/users/leaderboard", async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT
-        uid,
-        name,
-        email,
-        player_id,
-        avatar,
-        score,
-        stars,
-        is_vip,
-        is_admin,
-        created_at,
-        RANK() OVER (ORDER BY score DESC) AS rank
-      FROM users
-      ORDER BY score DESC
-      LIMIT 10
-    `);
-
-    res.json({ users: result.rows });
+    const users = await getTopLeaderboard();
+    res.json({ users });
   } catch (err) {
     console.error("LEADERBOARD ERROR:", err);
     res.status(500).json({ users: [], error: err.message });
@@ -1032,13 +1051,28 @@ app.patch("/users/:uid/profile", async (req, res) => {
 app.patch("/users/:uid/score", async (req, res) => {
   try {
     const { score } = req.body;
+    const { uid } = req.params;
 
-    await pool.query(
-      "UPDATE users SET score = $1, updated_at = NOW() WHERE uid = $2",
-      [score, req.params.uid]
+    const beforeTop = await getTopLeaderboard();
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET score = $1,
+          updated_at = NOW()
+      WHERE uid = $2
+      RETURNING *
+      `,
+      [score, uid]
     );
 
-    res.json({ success: true });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "USER_NOT_FOUND" });
+    }
+
+    await emitLeaderboardIfChanged(beforeTop);
+
+    res.json({ success: true, user: result.rows[0] });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
   }
@@ -1071,6 +1105,9 @@ app.patch("/users/:uid/vip", async (req, res) => {
 // 10. CHECK IN
 app.post("/users/:uid/check-in", async (req, res) => {
   try {
+    const { uid } = req.params;
+    const beforeTop = await getTopLeaderboard();
+
     const result = await pool.query(
       `
       UPDATE users
@@ -1082,12 +1119,14 @@ app.post("/users/:uid/check-in", async (req, res) => {
         AND (last_check_in IS NULL OR last_check_in < CURRENT_DATE)
       RETURNING *
       `,
-      [req.params.uid]
+      [uid]
     );
 
     if (result.rows.length === 0) {
       return res.status(400).json({ error: "ALREADY_CHECKED_IN" });
     }
+
+    await emitLeaderboardIfChanged(beforeTop);
 
     res.json({ user: result.rows[0] });
   } catch (err) {
@@ -1098,6 +1137,9 @@ app.post("/users/:uid/check-in", async (req, res) => {
 // 11. WATCH VIDEO REWARD
 app.post("/users/:uid/watch-video-reward", async (req, res) => {
   try {
+    const { uid } = req.params;
+    const beforeTop = await getTopLeaderboard();
+
     const result = await pool.query(
       `
       UPDATE users
@@ -1109,12 +1151,14 @@ app.post("/users/:uid/watch-video-reward", async (req, res) => {
         AND (last_video_watch IS NULL OR last_video_watch < CURRENT_DATE)
       RETURNING *
       `,
-      [req.params.uid]
+      [uid]
     );
 
     if (result.rows.length === 0) {
       return res.status(400).json({ error: "ALREADY_WATCHED_VIDEO" });
     }
+
+    await emitLeaderboardIfChanged(beforeTop);
 
     res.json({ user: result.rows[0] });
   } catch (err) {
