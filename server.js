@@ -2,13 +2,16 @@ const express = require("express");
 const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
-const { admin, db } = require("./firebase");
 const pool = require("./db");
 
 const app = express();
 
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
+
+// =========================
+// CACHE HEADER
+// =========================
 
 function setNoStore(res) {
   res.set("Cache-Control", "no-store");
@@ -17,6 +20,10 @@ function setNoStore(res) {
 function setShortCache(res, seconds = 5) {
   res.set("Cache-Control", `public, max-age=${seconds}`);
 }
+
+// =========================
+// TEST SERVER / DB
+// =========================
 
 app.get("/", (req, res) => {
   res.send("Dovui Server Running");
@@ -42,6 +49,10 @@ pool
   .then(() => console.log("POSTGRES CONNECTED"))
   .catch((err) => console.error("POSTGRES ERROR", err));
 
+// =========================
+// SOCKET SERVER
+// =========================
+
 const server = http.createServer(app);
 
 const io = new Server(server, {
@@ -50,8 +61,8 @@ const io = new Server(server, {
   },
 });
 
+// uid -> Set(socketId)
 const onlineUsers = new Map();
-const rooms = new Map();
 
 function getOnlineUserIds() {
   return Array.from(onlineUsers.keys());
@@ -94,68 +105,204 @@ function generateRoomId() {
   return id;
 }
 
+// =========================
+// USER HELPER
+// =========================
+
+async function getUserLite(uid) {
+  const result = await pool.query(
+    `
+    SELECT uid, name, avatar, score
+    FROM users
+    WHERE uid = $1
+    LIMIT 1
+    `,
+    [uid]
+  );
+
+  const user = result.rows[0];
+
+  return {
+    uid,
+    name: user?.name || "Ẩn danh",
+    avatar: user?.avatar || "",
+    score: Number(user?.score || 0),
+  };
+}
+
+// Bổ sung avatar cho player dựa vào userId.
+// Hàm này giúp phòng cũ chưa có avatar vẫn có thể hiển thị avatar.
+async function enrichPlayersWithAvatar(players = []) {
+  if (!Array.isArray(players) || players.length === 0) return [];
+
+  const userIds = [
+    ...new Set(
+      players
+        .map((p) => p.userId)
+        .filter((id) => typeof id === "string" && id.trim() !== "")
+    ),
+  ];
+
+  if (userIds.length === 0) return players;
+
+  const result = await pool.query(
+    `
+    SELECT uid, avatar, name
+    FROM users
+    WHERE uid = ANY($1::text[])
+    `,
+    [userIds]
+  );
+
+  const userMap = new Map();
+
+  for (const row of result.rows) {
+    userMap.set(row.uid, {
+      avatar: row.avatar || "",
+      name: row.name || "Ẩn danh",
+    });
+  }
+
+  return players.map((p) => {
+    const user = userMap.get(p.userId);
+
+    return {
+      ...p,
+      displayName: p.displayName || user?.name || "Ẩn danh",
+      avatar: p.avatar || user?.avatar || "",
+    };
+  });
+}
+
+// =========================
+// ROOM HELPER
+// =========================
+
 async function createRoomWithRetry(buildRoomData, maxRetry = 5) {
   for (let i = 0; i < maxRetry; i++) {
     const roomId = generateRoomId();
 
     const exists = await pool.query(
-      `SELECT room_id FROM game_rooms WHERE room_id = $1 LIMIT 1`,
+      `
+      SELECT room_id
+      FROM game_rooms
+      WHERE room_id = $1
+      LIMIT 1
+      `,
       [roomId]
     );
 
-    if (exists.rows.length === 0) {
-      const roomData = buildRoomData(roomId);
+    if (exists.rows.length > 0) continue;
 
-      await pool.query(
-        `
-        INSERT INTO game_rooms
-        (
-          room_id,
-          host_id,
-          host_name,
-          category_id,
-          category_name,
-          type,
-          password,
-          question_count,
-          time_per_question,
-          status,
-          players,
-          invited_users,
-          kicked_user_ids,
-          started_at,
-          current_level_id,
-          created_at,
-          updated_at
-        )
-        VALUES
-        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13::jsonb,$14,$15,NOW(),NOW())
-        `,
-        [
-          roomData.roomId,
-          roomData.hostId,
-          roomData.hostName,
-          roomData.categoryId,
-          roomData.categoryName,
-          roomData.type,
-          roomData.password,
-          roomData.questionCount,
-          roomData.timePerQuestion,
-          roomData.status,
-          JSON.stringify(roomData.players),
-          JSON.stringify(roomData.invitedUsers || []),
-          JSON.stringify(roomData.kickedUserIds || []),
-          roomData.startedAt || null,
-          roomData.currentLevelId || null,
-        ]
-      );
+    const roomData = buildRoomData(roomId);
 
-      return { roomId, roomData };
-    }
+    await pool.query(
+      `
+      INSERT INTO game_rooms
+      (
+        room_id,
+        host_id,
+        host_name,
+        category_id,
+        category_name,
+        type,
+        password,
+        question_count,
+        time_per_question,
+        status,
+        players,
+        invited_users,
+        kicked_user_ids,
+        started_at,
+        current_level_id,
+        created_at,
+        updated_at
+      )
+      VALUES
+      (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+        $11::jsonb,$12::jsonb,$13::jsonb,$14,$15,NOW(),NOW()
+      )
+      `,
+      [
+        roomData.roomId,
+        roomData.hostId,
+        roomData.hostName,
+        roomData.categoryId,
+        roomData.categoryName,
+        roomData.type,
+        roomData.password,
+        roomData.questionCount,
+        roomData.timePerQuestion,
+        roomData.status,
+        JSON.stringify(roomData.players),
+        JSON.stringify(roomData.invitedUsers || []),
+        JSON.stringify(roomData.kickedUserIds || []),
+        roomData.startedAt || null,
+        roomData.currentLevelId || null,
+      ]
+    );
+
+    return { roomId, roomData };
   }
 
   throw new Error("CREATE_ROOM_FAILED");
 }
+
+async function roomRowToClient(row) {
+  if (!row) return null;
+
+  const players = await enrichPlayersWithAvatar(
+    Array.isArray(row.players) ? row.players : []
+  );
+
+  return {
+    roomId: row.room_id,
+    hostId: row.host_id,
+    hostName: row.host_name,
+    categoryId: row.category_id,
+    categoryName: row.category_name || "",
+    type: row.type,
+    password: row.password || "",
+    questionCount: row.question_count,
+    timePerQuestion: row.time_per_question,
+    status: row.status,
+    players,
+    invitedUsers: Array.isArray(row.invited_users) ? row.invited_users : [],
+    kickedUserIds: Array.isArray(row.kicked_user_ids)
+      ? row.kicked_user_ids
+      : [],
+    startedAt: row.started_at,
+    currentLevelId: row.current_level_id,
+    createdAt: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
+    updatedAt: row.updated_at ? new Date(row.updated_at).getTime() : Date.now(),
+  };
+}
+
+async function getGameRoom(roomId) {
+  const result = await pool.query(
+    `
+    SELECT *
+    FROM game_rooms
+    WHERE room_id = $1
+    LIMIT 1
+    `,
+    [roomId]
+  );
+
+  return roomRowToClient(result.rows[0]);
+}
+
+async function emitRoomUpdated(roomId) {
+  const latestRoom = await getGameRoom(roomId);
+  if (!latestRoom) return;
+
+  io.to(roomId).emit("room_updated", latestRoom);
+}
+
+// =========================
+// LEADERBOARD HELPER
+// =========================
 
 async function getTopLeaderboard() {
   const result = await pool.query(`
@@ -191,13 +338,15 @@ async function emitLeaderboardIfChanged(beforeTop) {
 }
 
 // =========================
-// SOCKET
+// SOCKET EVENTS
 // =========================
+
 io.on("connection", (socket) => {
   console.log("Connected:", socket.id);
 
   socket.emit("online_users", getOnlineUserIds());
 
+  // User online
   socket.on("user_online", ({ uid }) => {
     if (!uid) return;
 
@@ -212,57 +361,796 @@ io.on("connection", (socket) => {
     socket.emit("online_users", getOnlineUserIds());
   });
 
-  socket.on("send_message", ({ roomId, message }) => {
-    if (!roomId || !message) return;
+  // User logout
+  socket.on("user_logout", ({ uid }) => {
+    if (!uid) return;
 
-    const msg = {
-      id: Date.now().toString(),
-      ...message,
-      createdAt: Date.now(),
-    };
+    removeOnlineUser(uid, socket.id);
 
-    const room = rooms.get(roomId);
-
-    if (room) {
-      room.messages.push(msg);
-
-      if (room.messages.length > 100) {
-        room.messages.shift();
-      }
-    }
-
-    io.to(roomId).emit("new_message", msg);
+    io.emit("user_status_changed", {
+      uid,
+      isOnline: false,
+    });
   });
 
-  socket.on("invite_friend", ({ fromUid, toUid, roomId, fromName }) => {
-    if (!fromUid || !toUid || !roomId) return;
+  // =========================
+  // GAME ROOM
+  // =========================
 
-    const sockets = onlineUsers.get(toUid);
-    if (!sockets) return;
+  // Client join socket room để nhận room_updated realtime.
+  socket.on("join_socket_room", ({ roomId }) => {
+    if (!roomId) return;
+    socket.join(roomId);
+  });
 
-    for (const socketId of sockets) {
-      io.to(socketId).emit("game_invite", {
-        fromUid,
-        fromName,
+  // Tạo phòng và lưu vào Neon.
+  socket.on("create_game_room", async (data, callback) => {
+    try {
+      const {
+        uid,
+        displayName,
+        categoryId,
+        categoryName = "",
+        type,
+        password = "",
+        questionCount = 10,
+        timePerQuestion = 15,
+      } = data;
+
+      if (!uid || !categoryId || !type) {
+        return callback?.({
+          success: false,
+          message: "Thiếu dữ liệu tạo phòng",
+        });
+      }
+
+      const user = await getUserLite(uid);
+      const now = Date.now();
+
+      const finalDisplayName = displayName || user.name;
+
+      const { roomId, roomData } = await createRoomWithRetry((newRoomId) => ({
+        roomId: newRoomId,
+        hostId: uid,
+        hostName: finalDisplayName,
+        categoryId,
+        categoryName,
+        type,
+        password,
+        questionCount,
+        timePerQuestion,
+        status: "waiting",
+        kickedUserIds: [],
+        invitedUsers: [],
+        startedAt: null,
+        currentLevelId: null,
+        createdAt: now,
+        updatedAt: now,
+        players: [
+          {
+            userId: uid,
+            displayName: finalDisplayName,
+            avatar: user.avatar,
+            score: 0,
+            isHost: true,
+            isReady: true,
+            isFinished: false,
+            joinedAt: now,
+          },
+        ],
+      }));
+
+      socket.join(roomId);
+
+      callback?.({
+        success: true,
         roomId,
+        room: roomData,
+      });
+
+      io.to(roomId).emit("room_updated", roomData);
+    } catch (error) {
+      console.error("create_game_room error:", error);
+
+      callback?.({
+        success: false,
+        message: "Không thể tạo phòng",
       });
     }
   });
 
-  socket.on("submit_answer", ({ roomId, uid, score }) => {
-    if (!roomId || !uid) return;
+  // Vào phòng bằng mã hoặc lời mời.
+  socket.on("join_game_room", async (data, callback) => {
+    try {
+      const {
+        roomId,
+        uid,
+        displayName,
+        password = "",
+        isDirectJoin = false,
+      } = data;
 
-    const room = rooms.get(roomId);
-    if (!room) return;
+      if (!roomId || !uid) {
+        return callback?.({
+          success: false,
+          message: "Thiếu dữ liệu vào phòng",
+        });
+      }
 
-    const player = room.players.find((p) => p.uid === uid);
+      const cleanRoomId = roomId.trim().toUpperCase();
 
-    if (player) {
-      player.score = score;
+      const room = await getGameRoom(cleanRoomId);
+
+      if (!room) {
+        return callback?.({
+          success: false,
+          message: "Phòng không tồn tại",
+        });
+      }
+
+      if (room.status !== "waiting") {
+        return callback?.({
+          success: false,
+          message: "Phòng đã bắt đầu",
+        });
+      }
+
+      const isInvited = room.invitedUsers.includes(uid);
+
+      if (isDirectJoin && !isInvited) {
+        return callback?.({
+          success: false,
+          message: "Bạn không có quyền tham gia phòng này",
+        });
+      }
+
+      if (!isDirectJoin && room.password && room.password !== password.trim()) {
+        return callback?.({
+          success: false,
+          message: "Sai mật khẩu",
+        });
+      }
+
+      if (room.players.length >= 8) {
+        return callback?.({
+          success: false,
+          message: "Phòng đã đầy",
+        });
+      }
+
+      const alreadyInRoom = room.players.some((p) => p.userId === uid);
+
+      const user = await getUserLite(uid);
+      const finalDisplayName = displayName || user.name;
+
+      const newPlayers = alreadyInRoom
+        ? room.players.map((p) =>
+            p.userId === uid
+              ? {
+                  ...p,
+                  displayName: p.displayName || finalDisplayName,
+                  avatar: p.avatar || user.avatar,
+                }
+              : p
+          )
+        : [
+            ...room.players,
+            {
+              userId: uid,
+              displayName: finalDisplayName,
+              avatar: user.avatar,
+              score: 0,
+              isHost: false,
+              isReady: false,
+              isFinished: false,
+              joinedAt: Date.now(),
+            },
+          ];
+
+      const kickedUserIds = room.kickedUserIds.filter((id) => id !== uid);
+
+      await pool.query(
+        `
+        UPDATE game_rooms
+        SET players = $1::jsonb,
+            kicked_user_ids = $2::jsonb,
+            updated_at = NOW()
+        WHERE room_id = $3
+        `,
+        [JSON.stringify(newPlayers), JSON.stringify(kickedUserIds), cleanRoomId]
+      );
+
+      socket.join(cleanRoomId);
+
+      const latestRoom = await getGameRoom(cleanRoomId);
+
+      callback?.({
+        success: true,
+        roomId: cleanRoomId,
+        room: latestRoom,
+      });
+
+      io.to(cleanRoomId).emit("room_updated", latestRoom);
+    } catch (error) {
+      console.error("join_game_room error:", error);
+
+      callback?.({
+        success: false,
+        message: "Không thể vào phòng",
+      });
     }
-
-    io.to(roomId).emit("room_updated", room);
   });
+
+  // Rời phòng.
+  // Nếu host rời hoặc phòng trống thì xóa phòng.
+  socket.on("leave_game_room", async (data, callback) => {
+    try {
+      const { roomId, uid } = data;
+
+      if (!roomId || !uid) {
+        return callback?.({
+          success: false,
+          message: "Thiếu dữ liệu rời phòng",
+        });
+      }
+
+      const room = await getGameRoom(roomId);
+
+      socket.leave(roomId);
+
+      if (!room) {
+        return callback?.({
+          success: true,
+        });
+      }
+
+      const currentPlayer = room.players.find((p) => p.userId === uid);
+      const newPlayers = room.players.filter((p) => p.userId !== uid);
+
+      if (newPlayers.length === 0 || currentPlayer?.isHost) {
+        io.to(roomId).emit("room_closed", {
+          roomId,
+          reason: "HOST_LEFT",
+        });
+
+        callback?.({
+          success: true,
+          closed: true,
+        });
+
+        setTimeout(async () => {
+          try {
+            await pool.query(
+              `
+              DELETE FROM game_rooms
+              WHERE room_id = $1
+              `,
+              [roomId]
+            );
+
+            io.in(roomId).socketsLeave(roomId);
+          } catch (error) {
+            console.error("delete room error:", error);
+          }
+        }, 500);
+
+        return;
+      }
+
+      await pool.query(
+        `
+        UPDATE game_rooms
+        SET players = $1::jsonb,
+            updated_at = NOW()
+        WHERE room_id = $2
+        `,
+        [JSON.stringify(newPlayers), roomId]
+      );
+
+      await emitRoomUpdated(roomId);
+
+      callback?.({
+        success: true,
+        closed: false,
+      });
+    } catch (error) {
+      console.error("leave_game_room error:", error);
+
+      callback?.({
+        success: false,
+        message: "Không thể rời phòng",
+      });
+    }
+  });
+
+  // Chủ phòng kick người chơi.
+  socket.on("kick_player", async (data, callback) => {
+    try {
+      const { roomId, uid, targetUserId } = data;
+
+      if (!roomId || !uid || !targetUserId) {
+        return callback?.({
+          success: false,
+          message: "Thiếu dữ liệu kick",
+        });
+      }
+
+      const room = await getGameRoom(roomId);
+
+      if (!room) {
+        return callback?.({
+          success: false,
+          message: "Phòng không tồn tại",
+        });
+      }
+
+      if (room.hostId !== uid) {
+        return callback?.({
+          success: false,
+          message: "Bạn không phải chủ phòng",
+        });
+      }
+
+      const newPlayers = room.players.filter(
+        (p) => p.userId !== targetUserId
+      );
+
+      const kickedUserIds = [...room.kickedUserIds];
+
+      if (!kickedUserIds.includes(targetUserId)) {
+        kickedUserIds.push(targetUserId);
+      }
+
+      await pool.query(
+        `
+        UPDATE game_rooms
+        SET players = $1::jsonb,
+            kicked_user_ids = $2::jsonb,
+            updated_at = NOW()
+        WHERE room_id = $3
+        `,
+        [JSON.stringify(newPlayers), JSON.stringify(kickedUserIds), roomId]
+      );
+
+      await emitRoomUpdated(roomId);
+
+      callback?.({
+        success: true,
+      });
+    } catch (error) {
+      console.error("kick_player error:", error);
+
+      callback?.({
+        success: false,
+        message: "Không thể kick người chơi",
+      });
+    }
+  });
+
+  // Chủ phòng đóng phòng.
+  socket.on("close_game_room", async (data, callback) => {
+    try {
+      const { roomId, uid } = data;
+
+      if (!roomId || !uid) {
+        return callback?.({
+          success: false,
+          message: "Thiếu dữ liệu đóng phòng",
+        });
+      }
+
+      const room = await getGameRoom(roomId);
+
+      if (!room) {
+        return callback?.({
+          success: true,
+        });
+      }
+
+      if (room.hostId !== uid) {
+        return callback?.({
+          success: false,
+          message: "Bạn không phải chủ phòng",
+        });
+      }
+
+      io.to(roomId).emit("room_closed", {
+        roomId,
+        reason: "HOST_CLOSED",
+      });
+
+      callback?.({
+        success: true,
+      });
+
+      setTimeout(async () => {
+        try {
+          await pool.query(
+            `
+            DELETE FROM game_rooms
+            WHERE room_id = $1
+            `,
+            [roomId]
+          );
+
+          io.in(roomId).socketsLeave(roomId);
+        } catch (error) {
+          console.error("close room delete error:", error);
+        }
+      }, 500);
+    } catch (error) {
+      console.error("close_game_room error:", error);
+
+      callback?.({
+        success: false,
+        message: "Không thể đóng phòng",
+      });
+    }
+  });
+
+  // Mời bạn bè.
+  // Đồng thời lưu uid được mời vào invited_users của Neon.
+  socket.on("invite_friend", async ({ fromUid, toUid, roomId, fromName }) => {
+    try {
+      if (!fromUid || !toUid || !roomId) return;
+
+      const cleanRoomId = roomId.trim().toUpperCase();
+
+      const room = await getGameRoom(cleanRoomId);
+      if (!room) return;
+
+      const invitedUsers = [...room.invitedUsers];
+
+      if (!invitedUsers.includes(toUid)) {
+        invitedUsers.push(toUid);
+      }
+
+      await pool.query(
+        `
+        UPDATE game_rooms
+        SET invited_users = $1::jsonb,
+            updated_at = NOW()
+        WHERE room_id = $2
+        `,
+        [JSON.stringify(invitedUsers), cleanRoomId]
+      );
+
+      await emitRoomUpdated(cleanRoomId);
+
+      const sockets = onlineUsers.get(toUid);
+      if (!sockets) return;
+
+      for (const socketId of sockets) {
+        io.to(socketId).emit("game_invite", {
+          fromUid,
+          fromName,
+          roomId: cleanRoomId,
+        });
+      }
+    } catch (error) {
+      console.error("invite_friend error:", error);
+    }
+  });
+
+  // =========================
+  // ROOM CHAT - NEON
+  // =========================
+
+  // Khi mở chat phòng, load 100 tin nhắn gần nhất từ Neon.
+  socket.on("join-room-chat", async ({ roomId }) => {
+    try {
+      if (!roomId) return;
+
+      socket.join(`room_chat_${roomId}`);
+
+      const result = await pool.query(
+        `
+        SELECT
+          id,
+          room_id,
+          user_id,
+          display_name,
+          text,
+          sent_at
+        FROM room_messages
+        WHERE room_id = $1
+        ORDER BY sent_at ASC
+        LIMIT 100
+        `,
+        [roomId]
+      );
+
+      const messages = result.rows.map((row) => ({
+        id: row.id.toString(),
+        roomId: row.room_id,
+        userId: row.user_id,
+        displayName: row.display_name || "Ẩn danh",
+        text: row.text || "",
+        sentAt: new Date(row.sent_at).toISOString(),
+      }));
+
+      socket.emit("room-messages", messages);
+    } catch (error) {
+      console.error("join-room-chat error:", error);
+    }
+  });
+
+  socket.on("leave-room-chat", ({ roomId }) => {
+    if (!roomId) return;
+    socket.leave(`room_chat_${roomId}`);
+  });
+
+  // Gửi tin nhắn phòng.
+  // Server lưu vào Neon rồi emit lại cho toàn bộ người trong phòng.
+  socket.on("send-room-message", async (data) => {
+    try {
+      const { roomId, userId, displayName, text } = data;
+
+      if (!roomId || !userId || !text?.trim()) return;
+
+      const user = await getUserLite(userId);
+
+      const result = await pool.query(
+        `
+        INSERT INTO room_messages
+        (
+          room_id,
+          user_id,
+          display_name,
+          text,
+          sent_at
+        )
+        VALUES ($1, $2, $3, $4, NOW())
+        RETURNING
+          id,
+          room_id,
+          user_id,
+          display_name,
+          text,
+          sent_at
+        `,
+        [
+          roomId,
+          userId,
+          displayName || user.name || "Ẩn danh",
+          text.trim(),
+        ]
+      );
+
+      const row = result.rows[0];
+
+      const message = {
+        id: row.id.toString(),
+        roomId: row.room_id,
+        userId: row.user_id,
+        displayName: row.display_name || "Ẩn danh",
+        text: row.text || "",
+        sentAt: new Date(row.sent_at).toISOString(),
+      };
+
+      io.to(`room_chat_${roomId}`).emit("room-message", message);
+    } catch (error) {
+      console.error("send-room-message error:", error);
+    }
+  });
+
+  // =========================
+  // GAME STATUS
+  // =========================
+
+  socket.on("set_player_ready", async ({ roomId, uid, isReady }) => {
+    try {
+      const room = await getGameRoom(roomId);
+      if (!room) return;
+
+      const players = room.players.map((p) =>
+        p.userId === uid ? { ...p, isReady } : p
+      );
+
+      await pool.query(
+        `
+        UPDATE game_rooms
+        SET players = $1::jsonb,
+            updated_at = NOW()
+        WHERE room_id = $2
+        `,
+        [JSON.stringify(players), roomId]
+      );
+
+      await emitRoomUpdated(roomId);
+    } catch (error) {
+      console.error("set_player_ready error:", error);
+    }
+  });
+
+  socket.on("start_game_with_reset", async ({ roomId }) => {
+    try {
+      const room = await getGameRoom(roomId);
+      if (!room) return;
+
+      const startedAt = Date.now();
+
+      const players = room.players.map((p) => ({
+        ...p,
+        score: 0,
+        isFinished: false,
+      }));
+
+      await pool.query(
+        `
+        UPDATE game_rooms
+        SET status = 'playing',
+            players = $1::jsonb,
+            started_at = $2,
+            updated_at = NOW()
+        WHERE room_id = $3
+        `,
+        [JSON.stringify(players), startedAt, roomId]
+      );
+
+      await emitRoomUpdated(roomId);
+    } catch (error) {
+      console.error("start_game_with_reset error:", error);
+    }
+  });
+
+  socket.on("update_room_score", async ({ roomId, uid, delta }) => {
+    try {
+      const room = await getGameRoom(roomId);
+      if (!room) return;
+
+      const players = room.players.map((p) =>
+        p.userId === uid
+          ? {
+              ...p,
+              score: Number(p.score || 0) + Number(delta || 0),
+            }
+          : p
+      );
+
+      await pool.query(
+        `
+        UPDATE game_rooms
+        SET players = $1::jsonb,
+            updated_at = NOW()
+        WHERE room_id = $2
+        `,
+        [JSON.stringify(players), roomId]
+      );
+
+      await emitRoomUpdated(roomId);
+    } catch (error) {
+      console.error("update_room_score error:", error);
+    }
+  });
+
+  socket.on("mark_player_finished", async ({ roomId, uid }) => {
+    try {
+      const room = await getGameRoom(roomId);
+      if (!room) return;
+
+      const players = room.players.map((p) =>
+        p.userId === uid ? { ...p, isFinished: true } : p
+      );
+
+      await pool.query(
+        `
+        UPDATE game_rooms
+        SET players = $1::jsonb,
+            updated_at = NOW()
+        WHERE room_id = $2
+        `,
+        [JSON.stringify(players), roomId]
+      );
+
+      await emitRoomUpdated(roomId);
+    } catch (error) {
+      console.error("mark_player_finished error:", error);
+    }
+  });
+
+  socket.on("finish_game", async ({ roomId }) => {
+    try {
+      const room = await getGameRoom(roomId);
+      if (!room) return;
+
+      const beforeTop = await getTopLeaderboard();
+
+      await pool.query("BEGIN");
+
+      await pool.query(
+        `
+        UPDATE game_rooms
+        SET status = 'waiting',
+            updated_at = NOW()
+        WHERE room_id = $1
+        `,
+        [roomId]
+      );
+
+      for (const p of room.players) {
+        const score = Number(p.score || 0);
+
+        if (score > 0) {
+          await pool.query(
+            `
+            UPDATE users
+            SET score = score + $1,
+                updated_at = NOW()
+            WHERE uid = $2
+            `,
+            [score, p.userId]
+          );
+        }
+      }
+
+      await pool.query("COMMIT");
+
+      await emitRoomUpdated(roomId);
+      await emitLeaderboardIfChanged(beforeTop);
+    } catch (error) {
+      await pool.query("ROLLBACK").catch(() => {});
+      console.error("finish_game error:", error);
+    }
+  });
+
+  socket.on("reset_room", async ({ roomId }) => {
+    try {
+      const room = await getGameRoom(roomId);
+      if (!room) return;
+
+      const players = room.players.map((p) => ({
+        ...p,
+        isFinished: false,
+      }));
+
+      await pool.query(
+        `
+        UPDATE game_rooms
+        SET status = 'waiting',
+            players = $1::jsonb,
+            started_at = NULL,
+            current_level_id = NULL,
+            updated_at = NOW()
+        WHERE room_id = $2
+        `,
+        [JSON.stringify(players), roomId]
+      );
+
+      await emitRoomUpdated(roomId);
+    } catch (error) {
+      console.error("reset_room error:", error);
+    }
+  });
+
+  socket.on("reset_all_players_ready", async ({ roomId }) => {
+    try {
+      const room = await getGameRoom(roomId);
+      if (!room) return;
+
+      const players = room.players.map((p) =>
+        p.isHost ? p : { ...p, isReady: false }
+      );
+
+      await pool.query(
+        `
+        UPDATE game_rooms
+        SET players = $1::jsonb,
+            updated_at = NOW()
+        WHERE room_id = $2
+        `,
+        [JSON.stringify(players), roomId]
+      );
+
+      await emitRoomUpdated(roomId);
+    } catch (error) {
+      console.error("reset_all_players_ready error:", error);
+    }
+  });
+
+  // =========================
+  // FRIEND CHAT
+  // =========================
 
   socket.on("join_friend_chat", async ({ currentUserId, friendId }) => {
     try {
@@ -335,7 +1223,14 @@ io.on("connection", (socket) => {
       const result = await pool.query(
         `
         INSERT INTO messages
-        (chat_id, sender_id, receiver_id, text, type, is_read)
+        (
+          chat_id,
+          sender_id,
+          receiver_id,
+          text,
+          type,
+          is_read
+        )
         VALUES ($1, $2, $3, $4, $5, $6)
         RETURNING
           id,
@@ -361,7 +1256,13 @@ io.on("connection", (socket) => {
       await pool.query(
         `
         INSERT INTO friend_chats
-        (chat_id, user1_id, user2_id, last_message, updated_at)
+        (
+          chat_id,
+          user1_id,
+          user2_id,
+          last_message,
+          updated_at
+        )
         VALUES ($1, $2, $3, $4, NOW())
         ON CONFLICT (chat_id)
         DO UPDATE SET
@@ -420,719 +1321,9 @@ io.on("connection", (socket) => {
     }
   });
 
-  function roomRowToClient(row) {
-    if (!row) return null;
-
-    return {
-      roomId: row.room_id,
-      hostId: row.host_id,
-      hostName: row.host_name,
-      categoryId: row.category_id,
-      categoryName: row.category_name || "",
-      type: row.type,
-      password: row.password || "",
-      questionCount: row.question_count,
-      timePerQuestion: row.time_per_question,
-      status: row.status,
-      players: Array.isArray(row.players) ? row.players : [],
-      invitedUsers: Array.isArray(row.invited_users) ? row.invited_users : [],
-      kickedUserIds: Array.isArray(row.kicked_user_ids)
-        ? row.kicked_user_ids
-        : [],
-      startedAt: row.started_at,
-      currentLevelId: row.current_level_id,
-      createdAt: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
-      updatedAt: row.updated_at ? new Date(row.updated_at).getTime() : Date.now(),
-    };
-  }
-
-  async function getGameRoom(roomId) {
-    const result = await pool.query(
-      `SELECT * FROM game_rooms WHERE room_id = $1 LIMIT 1`,
-      [roomId]
-    );
-
-    return roomRowToClient(result.rows[0]);
-  }
-
-  socket.on("create_game_room", async (data, callback) => {
-    try {
-      const {
-        uid,
-        displayName,
-        categoryId,
-        categoryName = "",
-        type,
-        password = "",
-        questionCount = 10,
-        timePerQuestion = 15,
-      } = data;
-
-      if (!uid || !displayName || !categoryId || !type) {
-        return callback?.({
-          success: false,
-          message: "Thiếu dữ liệu tạo phòng",
-        });
-      }
-
-      const now = Date.now();
-
-      const { roomId, roomData } = await createRoomWithRetry((newRoomId) => ({
-        roomId: newRoomId,
-        hostId: uid,
-        hostName: displayName,
-        categoryId,
-        categoryName,
-        type,
-        password,
-        questionCount,
-        timePerQuestion,
-        status: "waiting",
-        kickedUserIds: [],
-        invitedUsers: [],
-        startedAt: null,
-        currentLevelId: null,
-        createdAt: now,
-        updatedAt: now,
-        players: [
-          {
-            userId: uid,
-            displayName,
-            avatar,
-            score: 0,
-            isHost: false,
-            isReady: false,
-            isFinished: false,
-            joinedAt: Date.now(),
-          },
-        ],
-      }));
-
-      socket.join(roomId);
-
-      callback?.({
-        success: true,
-        roomId,
-        room: roomData,
-      });
-
-      io.to(roomId).emit("room_updated", roomData);
-    } catch (error) {
-      console.error("create_game_room error:", error);
-      callback?.({ success: false, message: "Không thể tạo phòng" });
-    }
-  });
-
-  socket.on("join_game_room", async (data, callback) => {
-    try {
-      const {
-        roomId,
-        uid,
-        displayName,
-        password = "",
-        isDirectJoin = false,
-      } = data;
-
-      if (!roomId || !uid || !displayName) {
-        return callback?.({
-          success: false,
-          message: "Thiếu dữ liệu vào phòng",
-        });
-      }
-
-      const cleanRoomId = roomId.trim().toUpperCase();
-
-      const result = await pool.query(
-        `SELECT * FROM game_rooms WHERE room_id = $1 LIMIT 1`,
-        [cleanRoomId]
-      );
-
-      if (result.rows.length === 0) {
-        return callback?.({ success: false, message: "Phòng không tồn tại" });
-      }
-
-      const room = roomRowToClient(result.rows[0]);
-
-      if (room.status !== "waiting") {
-        return callback?.({ success: false, message: "Phòng đã bắt đầu" });
-      }
-
-      if (isDirectJoin && !room.invitedUsers.includes(uid)) {
-        return callback?.({
-          success: false,
-          message: "Bạn không có quyền tham gia phòng này",
-        });
-      }
-
-      if (!isDirectJoin && room.password && room.password !== password.trim()) {
-        return callback?.({ success: false, message: "Sai mật khẩu" });
-      }
-
-      if (room.players.length >= 8) {
-        return callback?.({ success: false, message: "Phòng đã đầy" });
-      }
-
-      const userResult = await pool.query(
-        `SELECT avatar FROM users WHERE uid = $1 LIMIT 1`,
-        [uid]
-      );
-
-      const avatar = userResult.rows[0]?.avatar || "";
-
-      const alreadyInRoom = room.players.some((p) => p.userId === uid);
-
-      const newPlayers = alreadyInRoom
-        ? room.players
-        : [
-          ...room.players,
-          {
-            userId: uid,
-            displayName,
-            score: 0,
-            isHost: false,
-            isReady: false,
-            isFinished: false,
-            joinedAt: Date.now(),
-          },
-        ];
-
-      const kickedUserIds = room.kickedUserIds.filter((id) => id !== uid);
-
-      await pool.query(
-        `
-      UPDATE game_rooms
-      SET players = $1::jsonb,
-          kicked_user_ids = $2::jsonb,
-          updated_at = NOW()
-      WHERE room_id = $3
-      `,
-        [JSON.stringify(newPlayers), JSON.stringify(kickedUserIds), cleanRoomId]
-      );
-
-      const latestRoom = {
-        ...room,
-        players: newPlayers,
-        kickedUserIds,
-        updatedAt: Date.now(),
-      };
-
-      socket.join(cleanRoomId);
-
-      callback?.({
-        success: true,
-        roomId: cleanRoomId,
-        room: latestRoom,
-      });
-
-      io.to(cleanRoomId).emit("room_updated", latestRoom);
-    } catch (error) {
-      console.error("join_game_room error:", error);
-      callback?.({ success: false, message: "Không thể vào phòng" });
-    }
-  });
-
-  socket.on("leave_game_room", async (data, callback) => {
-    try {
-      const { roomId, uid } = data;
-
-      if (!roomId || !uid) {
-        return callback?.({
-          success: false,
-          message: "Thiếu dữ liệu rời phòng",
-        });
-      }
-
-      const room = await getGameRoom(roomId);
-
-      socket.leave(roomId);
-
-      if (!room) {
-        return callback?.({ success: true });
-      }
-
-      const currentPlayer = room.players.find((p) => p.userId === uid);
-      const newPlayers = room.players.filter((p) => p.userId !== uid);
-
-      if (newPlayers.length === 0 || currentPlayer?.isHost) {
-        io.to(roomId).emit("room_closed", {
-          roomId,
-          reason: "HOST_LEFT",
-        });
-
-        callback?.({
-          success: true,
-          closed: true,
-        });
-
-        setTimeout(async () => {
-          try {
-            await pool.query(`DELETE FROM game_rooms WHERE room_id = $1`, [
-              roomId,
-            ]);
-
-            rooms.delete(roomId);
-            io.in(roomId).socketsLeave(roomId);
-          } catch (error) {
-            console.error("delete Neon room after host left error:", error);
-          }
-        }, 500);
-
-        return;
-      }
-
-      await pool.query(
-        `
-      UPDATE game_rooms
-      SET players = $1::jsonb,
-          updated_at = NOW()
-      WHERE room_id = $2
-      `,
-        [JSON.stringify(newPlayers), roomId]
-      );
-
-      const latestRoom = {
-        ...room,
-        players: newPlayers,
-        updatedAt: Date.now(),
-      };
-
-      io.to(roomId).emit("room_updated", latestRoom);
-
-      callback?.({
-        success: true,
-        closed: false,
-      });
-    } catch (error) {
-      console.error("leave_game_room error:", error);
-      callback?.({ success: false, message: "Không thể rời phòng" });
-    }
-  });
-
-  socket.on("kick_player", async (data, callback) => {
-    try {
-      const { roomId, uid, targetUserId } = data;
-
-      if (!roomId || !uid || !targetUserId) {
-        return callback?.({ success: false, message: "Thiếu dữ liệu kick" });
-      }
-
-      const room = await getGameRoom(roomId);
-
-      if (!room) {
-        return callback?.({ success: false, message: "Phòng không tồn tại" });
-      }
-
-      if (room.hostId !== uid) {
-        return callback?.({ success: false, message: "Bạn không phải chủ phòng" });
-      }
-
-      const newPlayers = room.players.filter((p) => p.userId !== targetUserId);
-
-      const kickedUserIds = [...room.kickedUserIds];
-
-      if (!kickedUserIds.includes(targetUserId)) {
-        kickedUserIds.push(targetUserId);
-      }
-
-      await pool.query(
-        `
-      UPDATE game_rooms
-      SET players = $1::jsonb,
-          kicked_user_ids = $2::jsonb,
-          updated_at = NOW()
-      WHERE room_id = $3
-      `,
-        [JSON.stringify(newPlayers), JSON.stringify(kickedUserIds), roomId]
-      );
-
-      const latestRoom = {
-        ...room,
-        players: newPlayers,
-        kickedUserIds,
-        updatedAt: Date.now(),
-      };
-
-      io.to(roomId).emit("room_updated", latestRoom);
-
-      callback?.({ success: true });
-    } catch (error) {
-      console.error("kick_player error:", error);
-      callback?.({ success: false, message: "Không thể kick người chơi" });
-    }
-  });
-
-  socket.on("close_game_room", async (data, callback) => {
-    try {
-      const { roomId, uid } = data;
-
-      if (!roomId || !uid) {
-        return callback?.({
-          success: false,
-          message: "Thiếu dữ liệu đóng phòng",
-        });
-      }
-
-      const room = await getGameRoom(roomId);
-
-      if (!room) {
-        return callback?.({ success: true });
-      }
-
-      if (room.hostId !== uid) {
-        return callback?.({ success: false, message: "Bạn không phải chủ phòng" });
-      }
-
-      io.to(roomId).emit("room_closed", {
-        roomId,
-        reason: "HOST_CLOSED",
-      });
-
-      callback?.({ success: true });
-
-      setTimeout(async () => {
-        try {
-          await pool.query(`DELETE FROM game_rooms WHERE room_id = $1`, [roomId]);
-          rooms.delete(roomId);
-          io.in(roomId).socketsLeave(roomId);
-        } catch (error) {
-          console.error("close Neon room delete error:", error);
-        }
-      }, 500);
-    } catch (error) {
-      console.error("close_game_room error:", error);
-      callback?.({ success: false, message: "Không thể đóng phòng" });
-    }
-  });
-
   // =========================
-  // GAME ROOM - NEON OPTIMIZED
+  // DISCONNECT
   // =========================
-
-  // Client vào socket room để nhận room_updated nhanh
-  socket.on("join_socket_room", ({ roomId }) => {
-    if (!roomId) return;
-    socket.join(roomId);
-  });
-
-  // Load tin nhắn phòng từ Neon khi mở chat
-  socket.on("join-room-chat", async ({ roomId }) => {
-    try {
-      if (!roomId) return;
-
-      socket.join(`room_chat_${roomId}`);
-
-      const result = await pool.query(
-        `
-      SELECT id, room_id, user_id, display_name, text, sent_at
-      FROM room_messages
-      WHERE room_id = $1
-      ORDER BY sent_at ASC
-      LIMIT 100
-      `,
-        [roomId]
-      );
-
-      const messages = result.rows.map((row) => ({
-        id: row.id.toString(),
-        roomId: row.room_id,
-        userId: row.user_id,
-        displayName: row.display_name || "Ẩn danh",
-        text: row.text || "",
-        sentAt: new Date(row.sent_at).toISOString(),
-      }));
-
-      socket.emit("room-messages", messages);
-    } catch (error) {
-      console.error("join-room-chat error:", error);
-    }
-  });
-
-  // Rời chat room
-  socket.on("leave-room-chat", ({ roomId }) => {
-    if (!roomId) return;
-    socket.leave(`room_chat_${roomId}`);
-  });
-
-  // Gửi tin nhắn phòng + lưu Neon
-  socket.on("send-room-message", async (data) => {
-    try {
-      const { roomId, userId, displayName, text } = data;
-
-      if (!roomId || !userId || !text?.trim()) return;
-
-      const result = await pool.query(
-        `
-      INSERT INTO room_messages
-      (room_id, user_id, display_name, text, sent_at)
-      VALUES ($1, $2, $3, $4, NOW())
-      RETURNING id, room_id, user_id, display_name, text, sent_at
-      `,
-        [roomId, userId, displayName || "Ẩn danh", text.trim()]
-      );
-
-      const row = result.rows[0];
-
-      const message = {
-        id: row.id.toString(),
-        roomId: row.room_id,
-        userId: row.user_id,
-        displayName: row.display_name || "Ẩn danh",
-        text: row.text || "",
-        sentAt: new Date(row.sent_at).toISOString(),
-      };
-
-      io.to(`room_chat_${roomId}`).emit("room-message", message);
-    } catch (error) {
-      console.error("send-room-message error:", error);
-    }
-  });
-
-  // Sẵn sàng / hủy sẵn sàng
-  socket.on("set_player_ready", async ({ roomId, uid, isReady }) => {
-    try {
-      const room = await getGameRoom(roomId);
-      if (!room) return;
-
-      const players = room.players.map((p) =>
-        p.userId === uid ? { ...p, isReady } : p
-      );
-
-      await pool.query(
-        `
-      UPDATE game_rooms
-      SET players = $1::jsonb,
-          updated_at = NOW()
-      WHERE room_id = $2
-      `,
-        [JSON.stringify(players), roomId]
-      );
-
-      io.to(roomId).emit("room_updated", {
-        ...room,
-        players,
-        updatedAt: Date.now(),
-      });
-    } catch (error) {
-      console.error("set_player_ready error:", error);
-    }
-  });
-
-  // Chủ phòng bắt đầu game
-  socket.on("start_game_with_reset", async ({ roomId }) => {
-    try {
-      const room = await getGameRoom(roomId);
-      if (!room) return;
-
-      const startedAt = Date.now();
-
-      const players = room.players.map((p) => ({
-        ...p,
-        score: 0,
-        isFinished: false,
-      }));
-
-      await pool.query(
-        `
-      UPDATE game_rooms
-      SET status = 'playing',
-          players = $1::jsonb,
-          started_at = $2,
-          updated_at = NOW()
-      WHERE room_id = $3
-      `,
-        [JSON.stringify(players), startedAt, roomId]
-      );
-
-      io.to(roomId).emit("room_updated", {
-        ...room,
-        status: "playing",
-        players,
-        startedAt,
-        updatedAt: startedAt,
-      });
-    } catch (error) {
-      console.error("start_game_with_reset error:", error);
-    }
-  });
-
-  // Cập nhật điểm trong phòng
-  socket.on("update_room_score", async ({ roomId, uid, delta }) => {
-    try {
-      const room = await getGameRoom(roomId);
-      if (!room) return;
-
-      const players = room.players.map((p) =>
-        p.userId === uid
-          ? { ...p, score: Number(p.score || 0) + Number(delta || 0) }
-          : p
-      );
-
-      await pool.query(
-        `
-      UPDATE game_rooms
-      SET players = $1::jsonb,
-          updated_at = NOW()
-      WHERE room_id = $2
-      `,
-        [JSON.stringify(players), roomId]
-      );
-
-      io.to(roomId).emit("room_updated", {
-        ...room,
-        players,
-        updatedAt: Date.now(),
-      });
-    } catch (error) {
-      console.error("update_room_score error:", error);
-    }
-  });
-
-  // Người chơi hoàn thành
-  socket.on("mark_player_finished", async ({ roomId, uid }) => {
-    try {
-      const room = await getGameRoom(roomId);
-      if (!room) return;
-
-      const players = room.players.map((p) =>
-        p.userId === uid ? { ...p, isFinished: true } : p
-      );
-
-      await pool.query(
-        `
-      UPDATE game_rooms
-      SET players = $1::jsonb,
-          updated_at = NOW()
-      WHERE room_id = $2
-      `,
-        [JSON.stringify(players), roomId]
-      );
-
-      io.to(roomId).emit("room_updated", {
-        ...room,
-        players,
-        updatedAt: Date.now(),
-      });
-    } catch (error) {
-      console.error("mark_player_finished error:", error);
-    }
-  });
-
-  // Kết thúc game, cộng điểm vào users Neon
-  socket.on("finish_game", async ({ roomId }) => {
-    try {
-      const room = await getGameRoom(roomId);
-      if (!room) return;
-
-      await pool.query("BEGIN");
-
-      await pool.query(
-        `
-      UPDATE game_rooms
-      SET status = 'waiting',
-          updated_at = NOW()
-      WHERE room_id = $1
-      `,
-        [roomId]
-      );
-
-      for (const p of room.players) {
-        const score = Number(p.score || 0);
-
-        if (score > 0) {
-          await pool.query(
-            `
-          UPDATE users
-          SET score = score + $1,
-              updated_at = NOW()
-          WHERE uid = $2
-          `,
-            [score, p.userId]
-          );
-        }
-      }
-
-      await pool.query("COMMIT");
-
-      io.to(roomId).emit("room_updated", {
-        ...room,
-        status: "waiting",
-        updatedAt: Date.now(),
-      });
-
-      io.emit("leaderboard_updated", await getTopLeaderboard());
-    } catch (error) {
-      await pool.query("ROLLBACK").catch(() => { });
-      console.error("finish_game error:", error);
-    }
-  });
-
-  // Reset phòng về waiting
-  socket.on("reset_room", async ({ roomId }) => {
-    try {
-      const room = await getGameRoom(roomId);
-      if (!room) return;
-
-      const players = room.players.map((p) => ({
-        ...p,
-        isFinished: false,
-      }));
-
-      await pool.query(
-        `
-      UPDATE game_rooms
-      SET status = 'waiting',
-          players = $1::jsonb,
-          started_at = NULL,
-          current_level_id = NULL,
-          updated_at = NOW()
-      WHERE room_id = $2
-      `,
-        [JSON.stringify(players), roomId]
-      );
-
-      io.to(roomId).emit("room_updated", {
-        ...room,
-        status: "waiting",
-        players,
-        startedAt: null,
-        currentLevelId: null,
-        updatedAt: Date.now(),
-      });
-    } catch (error) {
-      console.error("reset_room error:", error);
-    }
-  });
-
-  // Sau game, reset ready non-host
-  socket.on("reset_all_players_ready", async ({ roomId }) => {
-    try {
-      const room = await getGameRoom(roomId);
-      if (!room) return;
-
-      const players = room.players.map((p) =>
-        p.isHost ? p : { ...p, isReady: false }
-      );
-
-      await pool.query(
-        `
-      UPDATE game_rooms
-      SET players = $1::jsonb,
-          updated_at = NOW()
-      WHERE room_id = $2
-      `,
-        [JSON.stringify(players), roomId]
-      );
-
-      io.to(roomId).emit("room_updated", {
-        ...room,
-        players,
-        updatedAt: Date.now(),
-      });
-    } catch (error) {
-      console.error("reset_all_players_ready error:", error);
-    }
-  });
-
 
   socket.on("disconnect", () => {
     const uid = socket.uid;
@@ -1152,16 +1343,10 @@ io.on("connection", (socket) => {
   });
 });
 
-socket.on("join_socket_room", ({ roomId }) => {
-  if (!roomId) return;
-  socket.join(roomId);
-});
-
 // =========================
 // USER ROUTES
 // =========================
 
-// 1. SYNC USER
 app.post("/users/sync", async (req, res) => {
   try {
     const { uid, name, email, avatar = "" } = req.body;
@@ -1232,7 +1417,6 @@ app.post("/users/sync", async (req, res) => {
   }
 });
 
-// 2. LEADERBOARD
 app.get("/users/leaderboard", async (req, res) => {
   try {
     const users = await getTopLeaderboard();
@@ -1252,7 +1436,6 @@ app.get("/users/leaderboard", async (req, res) => {
   }
 });
 
-// 3. COUNT
 app.get("/users/count", async (req, res) => {
   try {
     const result = await pool.query("SELECT COUNT(*) FROM users");
@@ -1270,7 +1453,6 @@ app.get("/users/count", async (req, res) => {
   }
 });
 
-// 4. CHECK NAME
 app.get("/users/check-name", async (req, res) => {
   try {
     const name = req.query.name?.trim();
@@ -1302,7 +1484,6 @@ app.get("/users/check-name", async (req, res) => {
   }
 });
 
-// 5. CHECK PLAYER ID
 app.get("/users/check-player-id", async (req, res) => {
   try {
     const playerId = req.query.playerId?.trim();
@@ -1341,7 +1522,6 @@ app.get("/users/check-player-id", async (req, res) => {
   }
 });
 
-// 6. GET USER BY NAME
 app.get("/users/by-name/:name", async (req, res) => {
   try {
     const name = req.params.name?.trim();
@@ -1386,7 +1566,6 @@ app.get("/users/by-name/:name", async (req, res) => {
   }
 });
 
-// 7. UPDATE PROFILE
 app.patch("/users/:uid/profile", async (req, res) => {
   try {
     const { uid } = req.params;
@@ -1461,7 +1640,6 @@ app.patch("/users/:uid/profile", async (req, res) => {
   }
 });
 
-// 8. UPDATE SCORE
 app.patch("/users/:uid/score", async (req, res) => {
   try {
     const { score } = req.body;
@@ -1521,7 +1699,6 @@ app.patch("/users/:uid/score", async (req, res) => {
   }
 });
 
-// 9. UPDATE VIP
 app.patch("/users/:uid/vip", async (req, res) => {
   try {
     const result = await pool.query(
@@ -1564,7 +1741,6 @@ app.patch("/users/:uid/vip", async (req, res) => {
   }
 });
 
-// 10. CHECK IN
 app.post("/users/:uid/check-in", async (req, res) => {
   try {
     const { uid } = req.params;
@@ -1614,7 +1790,6 @@ app.post("/users/:uid/check-in", async (req, res) => {
   }
 });
 
-// 11. WATCH VIDEO REWARD
 app.post("/users/:uid/watch-video-reward", async (req, res) => {
   try {
     const { uid } = req.params;
@@ -1664,7 +1839,6 @@ app.post("/users/:uid/watch-video-reward", async (req, res) => {
   }
 });
 
-// 12. HOME USER
 app.get("/users/:uid/home", async (req, res) => {
   try {
     const result = await pool.query(
@@ -1706,7 +1880,6 @@ app.get("/users/:uid/home", async (req, res) => {
   }
 });
 
-// 13. ADD SCORE
 app.post("/users/add-score", async (req, res) => {
   try {
     const { uid, score } = req.body;
@@ -1754,7 +1927,6 @@ app.post("/users/add-score", async (req, res) => {
   }
 });
 
-// 14. DEDUCT SCORE
 app.post("/users/deduct-score", async (req, res) => {
   try {
     const { uid, amount } = req.body;
@@ -1803,7 +1975,6 @@ app.post("/users/deduct-score", async (req, res) => {
   }
 });
 
-// 15. GET USER BY UID
 app.get("/users/:uid", async (req, res) => {
   try {
     const result = await pool.query(
@@ -1846,7 +2017,10 @@ app.get("/users/:uid", async (req, res) => {
   }
 });
 
-// 16. SAVE QUIZ PROGRESS
+// =========================
+// QUIZ PROGRESS ROUTES
+// =========================
+
 app.post("/quiz-progress/save", async (req, res) => {
   try {
     const { uid, categoryId, levelId = "", questionIndex } = req.body;
@@ -1871,13 +2045,17 @@ app.post("/quiz-progress/save", async (req, res) => {
       [uid, categoryId, levelId, questionIndex]
     );
 
-    res.json({ success: true });
+    res.json({
+      success: true,
+    });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({
+      success: false,
+      error: e.message,
+    });
   }
 });
 
-// 17. LOAD QUIZ PROGRESS
 app.get("/quiz-progress/load", async (req, res) => {
   try {
     const { uid, categoryId, levelId = "" } = req.query;
@@ -1902,7 +2080,9 @@ app.get("/quiz-progress/load", async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.json({ progress: null });
+      return res.json({
+        progress: null,
+      });
     }
 
     res.json({
@@ -1911,11 +2091,13 @@ app.get("/quiz-progress/load", async (req, res) => {
       },
     });
   } catch (e) {
-    res.status(500).json({ progress: null, error: e.message });
+    res.status(500).json({
+      progress: null,
+      error: e.message,
+    });
   }
 });
 
-// 18. CLEAR QUIZ PROGRESS
 app.delete("/quiz-progress/clear", async (req, res) => {
   try {
     const { uid, categoryId, levelId = "" } = req.body;
@@ -1937,16 +2119,30 @@ app.delete("/quiz-progress/clear", async (req, res) => {
       [uid, categoryId, levelId]
     );
 
-    res.json({ success: true });
+    res.json({
+      success: true,
+    });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({
+      success: false,
+      error: e.message,
+    });
   }
 });
 
-// 19. DELETE USER
+// =========================
+// DELETE USER
+// =========================
+
 app.delete("/users/:uid", async (req, res) => {
   try {
-    await pool.query("DELETE FROM users WHERE uid = $1", [req.params.uid]);
+    await pool.query(
+      `
+      DELETE FROM users
+      WHERE uid = $1
+      `,
+      [req.params.uid]
+    );
 
     res.json({
       success: true,
@@ -1958,6 +2154,10 @@ app.delete("/users/:uid", async (req, res) => {
     });
   }
 });
+
+// =========================
+// START SERVER
+// =========================
 
 const PORT = process.env.PORT || 3000;
 
