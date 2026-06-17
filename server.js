@@ -965,7 +965,7 @@ app.post("/users/sync", async (req, res) => {
       DO UPDATE SET
         name = EXCLUDED.name,
         email = EXCLUDED.email,
-        avatar = EXCLUDED.avatar,
+        avatar = "",
         updated_at = NOW()
       RETURNING *
       `,
