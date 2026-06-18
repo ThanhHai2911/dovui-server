@@ -406,6 +406,39 @@ async function emitLeaderboardIfChanged(beforeTop) {
   return afterTop;
 }
 
+async function emitUserUpdated(uid) {
+  const result = await pool.query(
+    `
+    SELECT
+      u.uid,
+      u.name,
+      u.email,
+      u.player_id,
+      u.avatar,
+      u.score,
+      u.is_vip,
+      u.is_admin,
+      u.is_online,
+      u.last_seen,
+      u.created_at,
+      u.updated_at,
+      (
+        SELECT COUNT(*) + 1
+        FROM users x
+        WHERE x.score > u.score
+      ) AS rank
+    FROM users u
+    WHERE u.uid = $1
+    LIMIT 1
+    `,
+    [uid]
+  );
+
+  if (result.rows.length === 0) return;
+
+  io.emit(`user_updated_${uid}`, result.rows[0]);
+}
+
 async function getUserByUid(uid) {
   const result = await pool.query(
     `
@@ -1205,6 +1238,9 @@ io.on("connection", (socket) => {
           );
         }
       }
+      for (const p of room.players) {
+        await emitUserUpdated(p.userId);
+      }
 
       await pool.query("COMMIT");
 
@@ -1808,6 +1844,7 @@ app.patch("/users/:uid/score", async (req, res) => {
     }
 
     await emitLeaderboardIfChanged(beforeTop);
+    await emitUserUpdated(uid);
 
     res.json({
       success: true,
@@ -1901,6 +1938,7 @@ app.post("/users/:uid/check-in", async (req, res) => {
     }
 
     await emitLeaderboardIfChanged(beforeTop);
+    await emitUserUpdated(uid);
 
     res.json({
       user: result.rows[0],
@@ -1950,6 +1988,7 @@ app.post("/users/:uid/watch-video-reward", async (req, res) => {
     }
 
     await emitLeaderboardIfChanged(beforeTop);
+    await emitUserUpdated(uid);
 
     res.json({
       user: result.rows[0],
@@ -2036,6 +2075,7 @@ app.post("/users/add-score", async (req, res) => {
     }
 
     await emitLeaderboardIfChanged(beforeTop);
+    await emitUserUpdated(uid);
 
     res.json({
       success: true,
@@ -2084,6 +2124,7 @@ app.post("/users/deduct-score", async (req, res) => {
     }
 
     await emitLeaderboardIfChanged(beforeTop);
+    await emitUserUpdated(uid);
 
     res.json({
       success: true,
@@ -2975,7 +3016,7 @@ app.delete("/users/:uid", async (req, res) => {
       success: true,
     });
   } catch (e) {
-    await client.query("ROLLBACK").catch(() => {});
+    await client.query("ROLLBACK").catch(() => { });
 
     console.error("DELETE USER ERROR:", e);
 
