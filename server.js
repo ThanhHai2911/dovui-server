@@ -406,7 +406,26 @@ async function emitLeaderboardIfChanged(beforeTop) {
   return afterTop;
 }
 
-async function emitUserUpdated(uid) {
+const lastUserPayloads = new Map();
+
+function userKey(user) {
+  if (!user) return "";
+
+  return [
+    user.uid,
+    user.name,
+    user.email,
+    user.player_id,
+    user.avatar,
+    user.score,
+    user.rank,
+    user.is_vip,
+    user.is_admin,
+    user.is_online,
+  ].join("|");
+}
+
+async function getFullUser(uid) {
   const result = await pool.query(
     `
     SELECT
@@ -434,9 +453,51 @@ async function emitUserUpdated(uid) {
     [uid]
   );
 
-  if (result.rows.length === 0) return;
+  return result.rows[0] || null;
+}
 
-  io.emit(`user_updated_${uid}`, result.rows[0]);
+async function emitUserUpdated(uid, force = false) {
+  if (!uid) return;
+
+  const user = await getFullUser(uid);
+  if (!user) return;
+
+  const key = userKey(user);
+  const oldKey = lastUserPayloads.get(uid);
+
+  // Chỉ emit khi dữ liệu thật sự đổi
+  if (!force && oldKey === key) return;
+
+  lastUserPayloads.set(uid, key);
+
+  const sockets = onlineUsers.get(uid);
+
+  // Chỉ gửi cho đúng user đó, không broadcast toàn app
+  if (sockets) {
+    for (const socketId of sockets) {
+      io.to(socketId).emit(`user_updated_${uid}`, user);
+    }
+  }
+}
+
+async function emitUserUpdated(uid, force = false) {
+  const user = await getFullUser(uid);
+  if (!user) return;
+
+  const key = userKey(user);
+  const oldKey = lastUserPayloads.get(uid);
+
+  if (!force && oldKey === key) return;
+
+  lastUserPayloads.set(uid, key);
+
+  const sockets = onlineUsers.get(uid);
+
+  if (sockets) {
+    for (const socketId of sockets) {
+      io.to(socketId).emit(`user_updated_${uid}`, user);
+    }
+  }
 }
 
 async function getUserByUid(uid) {
@@ -1246,6 +1307,10 @@ io.on("connection", (socket) => {
 
       await emitRoomUpdated(roomId);
       await emitLeaderboardIfChanged(beforeTop);
+
+      for (const p of room.players) {
+        await emitUserUpdated(p.userId);
+      }
     } catch (error) {
       await pool.query("ROLLBACK").catch(() => { });
       console.error("finish_game error:", error);
@@ -1559,11 +1624,15 @@ app.post("/users/sync", async (req, res) => {
       [uid, name || "", email || "", playerId, avatar || ""]
     );
 
+    const user = result.rows[0];
+
+    await emitUserUpdated(user.uid, true);
+
     setNoStore(res);
 
     res.json({
       success: true,
-      user: result.rows[0],
+      user,
     });
   } catch (e) {
     console.error("SYNC USER ERROR:", e);
@@ -1786,8 +1855,12 @@ app.patch("/users/:uid/profile", async (req, res) => {
       });
     }
 
+    const user = result.rows[0];
+
+    await emitUserUpdated(uid, true);
+
     res.json({
-      user: result.rows[0],
+      user,
     });
   } catch (err) {
     console.error("UPDATE PROFILE ERROR:", err);
@@ -1890,8 +1963,12 @@ app.patch("/users/:uid/vip", async (req, res) => {
       });
     }
 
+    const user = result.rows[0];
+
+    await emitUserUpdated(req.params.uid, true);
+
     res.json({
-      user: result.rows[0],
+      user,
     });
   } catch (err) {
     res.status(500).json({
