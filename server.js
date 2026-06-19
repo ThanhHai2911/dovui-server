@@ -393,7 +393,12 @@ async function getTopLeaderboard() {
 }
 
 function leaderboardKey(list) {
-  return list.map((u) => `${u.uid}:${u.score}:${u.rank}`).join("|");
+  return list
+    .map(
+      (u) =>
+        `${u.uid}:${u.score}:${u.rank}:${u.name}:${u.avatar}:${u.is_vip}`
+    )
+    .join("|");
 }
 
 async function emitLeaderboardIfChanged(beforeTop) {
@@ -1799,6 +1804,7 @@ app.patch("/users/:uid/profile", async (req, res) => {
     const name = req.body.name?.trim();
     const playerId = (req.body.playerId || req.body.player_id)?.trim();
     const avatar = req.body.avatar ?? null;
+    const beforeTop = await getTopLeaderboard();
 
     if (!name || !playerId) {
       return res.status(400).json({
@@ -1858,6 +1864,7 @@ app.patch("/users/:uid/profile", async (req, res) => {
     const user = result.rows[0];
 
     await emitUserUpdated(uid, true);
+    await emitLeaderboardIfChanged(beforeTop);
 
     res.json({
       user,
