@@ -3004,6 +3004,85 @@ function notifyFriendChanged(uid) {
   }
 }
 
+// admin
+
+app.get("/admin/users", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        uid,
+        name,
+        email,
+        player_id,
+        avatar,
+        score,
+        is_vip,
+        is_admin,
+        is_online,
+        created_at,
+        updated_at
+      FROM users
+      ORDER BY created_at DESC
+    `);
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /admin/users error:", err);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
+app.patch("/admin/users/:uid", async (req, res) => {
+  try {
+    const { uid } = req.params;
+    const { name, email, is_admin, is_vip } = req.body;
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET 
+        name = $1,
+        email = $2,
+        is_admin = $3,
+        is_vip = $4,
+        updated_at = NOW()
+      WHERE uid = $5
+      RETURNING *
+      `,
+      [name, email, is_admin, is_vip, uid]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: "USER_NOT_FOUND" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("PATCH /admin/users/:uid error:", err);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
+app.delete("/admin/users/:uid", async (req, res) => {
+  try {
+    const { uid } = req.params;
+
+    const result = await pool.query(
+      `DELETE FROM users WHERE uid = $1 RETURNING uid`,
+      [uid]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: "USER_NOT_FOUND" });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("DELETE /admin/users/:uid error:", err);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
+
 // =========================
 // DELETE USER
 // =========================
